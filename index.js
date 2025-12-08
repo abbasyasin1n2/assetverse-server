@@ -156,12 +156,12 @@ async function run() {
 
     // ============ CLOUDINARY ROUTES ============
 
-    // Initialize Cloudinary folder structure (creates assestverse/assets and assestverse/users)
+    // Initialize Cloudinary folder structure
     app.post('/cloudinary/init-folders', async (req, res) => {
       try {
         // Create placeholder files in each folder to ensure folders exist
         // Cloudinary creates folders automatically when you upload to them
-        const folders = ['assestverse/assets', 'assestverse/users'];
+        const folders = ['assetverse/assets', 'assetverse/companies', 'assetverse/employees'];
         
         const results = await Promise.all(
           folders.map(async (folder) => {
@@ -201,8 +201,12 @@ async function run() {
       try {
         const { folder } = req.body;
         
-        // Validate folder - only allow uploads to assestverse/assets or assestverse/users
-        const allowedFolders = ['assestverse/assets', 'assestverse/users'];
+        // Validate folder - only allow uploads to approved folders
+        const allowedFolders = [
+          'assetverse/assets',
+          'assetverse/companies',
+          'assetverse/employees',
+        ];
         if (!folder || !allowedFolders.includes(folder)) {
           return res.status(400).send({
             success: false,
@@ -247,7 +251,11 @@ async function run() {
       try {
         const { folder } = req.query;
         
-        const allowedFolders = ['assestverse/assets', 'assestverse/users'];
+        const allowedFolders = [
+          'assetverse/assets',
+          'assetverse/companies',
+          'assetverse/employees',
+        ];
         if (!folder || !allowedFolders.includes(folder)) {
           return res.status(400).send({
             success: false,
@@ -292,10 +300,139 @@ async function run() {
         cloudName: process.env.CLOUDINARY_CLOUD_NAME,
         apiKey: process.env.CLOUDINARY_API_KEY,
         folders: {
-          assets: 'assestverse/assets',
-          users: 'assestverse/users',
+          assets: 'assetverse/assets',
+          companies: 'assetverse/companies',
+          employees: 'assetverse/employees',
         },
       });
+    });
+
+    // ============ USER ROUTES ============
+
+    // Create/Register a new user
+    app.post('/users', async (req, res) => {
+      try {
+        const userData = req.body;
+        
+        // Validate required fields
+        if (!userData.email || !userData.name || !userData.role) {
+          return res.status(400).send({ 
+            success: false, 
+            message: 'Missing required fields: email, name, role' 
+          });
+        }
+
+        // Check if user already exists
+        const existingUser = await usersCollection.findOne({ email: userData.email });
+        if (existingUser) {
+          return res.status(409).send({ 
+            success: false, 
+            message: 'User already exists with this email' 
+          });
+        }
+
+        // Add timestamps if not provided
+        const userToInsert = {
+          ...userData,
+          createdAt: userData.createdAt || new Date().toISOString(),
+          updatedAt: userData.updatedAt || new Date().toISOString(),
+        };
+
+        const result = await usersCollection.insertOne(userToInsert);
+        
+        return res.status(201).send({
+          success: true,
+          message: 'User registered successfully',
+          insertedId: result.insertedId,
+        });
+      } catch (error) {
+        console.error('Error creating user:', error);
+        return res.status(500).send({ 
+          success: false, 
+          message: 'Failed to create user',
+          error: error.message 
+        });
+      }
+    });
+
+    // Get user by email
+    app.get('/users/:email', async (req, res) => {
+      try {
+        const { email } = req.params;
+        
+        const user = await usersCollection.findOne({ email });
+        
+        if (!user) {
+          return res.status(404).send({ 
+            success: false, 
+            message: 'User not found' 
+          });
+        }
+
+        return res.send(user);
+      } catch (error) {
+        console.error('Error fetching user:', error);
+        return res.status(500).send({ 
+          success: false, 
+          message: 'Failed to fetch user',
+          error: error.message 
+        });
+      }
+    });
+
+    // Update user by email
+    app.patch('/users/:email', async (req, res) => {
+      try {
+        const { email } = req.params;
+        const updateData = req.body;
+
+        // Don't allow email or role changes through this endpoint
+        delete updateData.email;
+        delete updateData.role;
+
+        updateData.updatedAt = new Date().toISOString();
+
+        const result = await usersCollection.updateOne(
+          { email },
+          { $set: updateData }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).send({ 
+            success: false, 
+            message: 'User not found' 
+          });
+        }
+
+        return res.send({
+          success: true,
+          message: 'User updated successfully',
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        console.error('Error updating user:', error);
+        return res.status(500).send({ 
+          success: false, 
+          message: 'Failed to update user',
+          error: error.message 
+        });
+      }
+    });
+
+    // Check if email exists (for registration validation)
+    app.get('/users/check/:email', async (req, res) => {
+      try {
+        const { email } = req.params;
+        const user = await usersCollection.findOne({ email }, { projection: { _id: 1 } });
+        
+        return res.send({ exists: Boolean(user) });
+      } catch (error) {
+        console.error('Error checking email:', error);
+        return res.status(500).send({ 
+          success: false, 
+          message: 'Failed to check email' 
+        });
+      }
     });
 
     app.get('/', (req, res) => {

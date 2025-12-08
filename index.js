@@ -632,7 +632,7 @@ async function run() {
     // Get all assets for HR's company (with search, filter, pagination)
     app.get('/assets', verifyToken, async (req, res) => {
       try {
-        const { search, type, status, sort, page = 1, limit = 10 } = req.query;
+        const { search, type, category, status, sort, page = 1, limit = 10 } = req.query;
         const userEmail = req.user.email;
 
         // Get user to check role
@@ -661,6 +661,11 @@ async function run() {
         // Type filter (returnable/non-returnable)
         if (type && type !== 'all') {
           query.type = type;
+        }
+
+        // Category filter
+        if (category && category !== 'All Categories') {
+          query.category = category;
         }
 
         // Status filter

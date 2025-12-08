@@ -1223,6 +1223,28 @@ async function run() {
           });
         }
 
+        // Check if this will create a new affiliation - need to verify package limit
+        const existingAffiliation = await employeeAffiliationsCollection.findOne({
+          employeeEmail: request.employeeEmail,
+          companyEmail: hrEmail,
+        });
+
+        // Only check limit if this would add a new employee (new affiliation or reactivating removed one)
+        const willAddNewEmployee = !existingAffiliation || existingAffiliation.status !== 'active';
+        
+        if (willAddNewEmployee) {
+          const hrUser = await usersCollection.findOne({ email: hrEmail });
+          const currentEmployees = hrUser?.currentEmployees || 0;
+          const packageLimit = hrUser?.packageLimit || 5;
+
+          if (currentEmployees >= packageLimit) {
+            return res.status(400).send({
+              success: false,
+              message: `Employee limit reached (${currentEmployees}/${packageLimit}). Please upgrade your package to add more employees.`,
+            });
+          }
+        }
+
         // Update request status
         await requestsCollection.updateOne(
           { _id: new ObjectId(id) },
@@ -1245,12 +1267,7 @@ async function run() {
           }
         );
 
-        // Create or reactivate employee affiliation
-        const existingAffiliation = await employeeAffiliationsCollection.findOne({
-          employeeEmail: request.employeeEmail,
-          companyEmail: hrEmail,
-        });
-
+        // Create or reactivate employee affiliation (existingAffiliation already fetched above)
         if (!existingAffiliation) {
           // No affiliation exists - create new one
           await employeeAffiliationsCollection.insertOne({

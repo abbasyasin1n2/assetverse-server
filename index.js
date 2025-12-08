@@ -435,6 +435,142 @@ async function run() {
       }
     });
 
+    // ============ PACKAGES ROUTES ============
+
+    // Default packages data
+    const defaultPackages = [
+      {
+        name: 'Basic',
+        price: 0,
+        currency: 'BDT',
+        employeeLimit: 5,
+        features: [
+          'Up to 5 employees',
+          'Basic asset tracking',
+          'Email support',
+          'Monthly reports',
+        ],
+        isPopular: false,
+        stripePriceId: null,
+      },
+      {
+        name: 'Standard',
+        price: 8,
+        currency: 'USD',
+        employeeLimit: 10,
+        features: [
+          'Up to 10 employees',
+          'Advanced asset tracking',
+          'Priority email support',
+          'Weekly reports',
+          'Asset analytics',
+        ],
+        isPopular: true,
+        stripePriceId: process.env.STRIPE_STANDARD_PRICE_ID || null,
+      },
+      {
+        name: 'Premium',
+        price: 15,
+        currency: 'USD',
+        employeeLimit: 20,
+        features: [
+          'Up to 20 employees',
+          'Full asset management',
+          '24/7 priority support',
+          'Real-time reports',
+          'Advanced analytics',
+          'Custom integrations',
+          'Dedicated account manager',
+        ],
+        isPopular: false,
+        stripePriceId: process.env.STRIPE_PREMIUM_PRICE_ID || null,
+      },
+    ];
+
+    // Get all packages
+    app.get('/packages', async (req, res) => {
+      try {
+        const packages = await packagesCollection.find({}).toArray();
+        
+        // If no packages in DB, return default packages
+        if (packages.length === 0) {
+          return res.send(defaultPackages);
+        }
+
+        return res.send(packages);
+      } catch (error) {
+        console.error('Error fetching packages:', error);
+        return res.status(500).send({ 
+          success: false, 
+          message: 'Failed to fetch packages',
+          error: error.message 
+        });
+      }
+    });
+
+    // Get single package by ID
+    app.get('/packages/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { ObjectId } = require('mongodb');
+        
+        const package_ = await packagesCollection.findOne({ 
+          _id: new ObjectId(id) 
+        });
+        
+        if (!package_) {
+          return res.status(404).send({ 
+            success: false, 
+            message: 'Package not found' 
+          });
+        }
+
+        return res.send(package_);
+      } catch (error) {
+        console.error('Error fetching package:', error);
+        return res.status(500).send({ 
+          success: false, 
+          message: 'Failed to fetch package',
+          error: error.message 
+        });
+      }
+    });
+
+    // Get package by name (for registration)
+    app.get('/packages/name/:name', async (req, res) => {
+      try {
+        const { name } = req.params;
+        
+        // First try from DB
+        let package_ = await packagesCollection.findOne({ 
+          name: { $regex: new RegExp(`^${name}$`, 'i') }
+        });
+        
+        // If not in DB, find from defaults
+        if (!package_) {
+          package_ = defaultPackages.find(
+            p => p.name.toLowerCase() === name.toLowerCase()
+          );
+        }
+
+        if (!package_) {
+          return res.status(404).send({ 
+            success: false, 
+            message: 'Package not found' 
+          });
+        }
+
+        return res.send(package_);
+      } catch (error) {
+        console.error('Error fetching package by name:', error);
+        return res.status(500).send({ 
+          success: false, 
+          message: 'Failed to fetch package',
+          error: error.message 
+        });
+      }
+    });
+
     app.get('/', (req, res) => {
       res.send('AssetVerse server is running');
     });

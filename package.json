@@ -6,6 +6,10 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node index.js",
+    "seed": "node scripts/seed.js",
+    "seed:force": "node scripts/seed.js --force",
+    "seed:all": "node scripts/seed.js --with-assets",
+    "seed:all:force": "node scripts/seed.js --with-assets --force",
     "lint": "echo \"No linter configured\""
   },
   "keywords": [],

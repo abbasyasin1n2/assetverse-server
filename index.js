@@ -1300,6 +1300,226 @@ async function run() {
       }
     });
 
+    // ============ EMPLOYEE AFFILIATIONS ROUTES ============
+
+    // Get HR's employees (affiliated employees)
+    app.get('/affiliations/employees', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const hrEmail = req.user.email;
+        const { search, page = 1, limit = 10 } = req.query;
+
+        let query = { companyEmail: hrEmail, status: 'active' };
+
+        if (search) {
+          query.$or = [
+            { employeeName: { $regex: search, $options: 'i' } },
+            { employeeEmail: { $regex: search, $options: 'i' } },
+          ];
+        }
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const totalCount = await employeeAffiliationsCollection.countDocuments(query);
+
+        const affiliations = await employeeAffiliationsCollection
+          .find(query)
+          .sort({ affiliatedAt: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        // Get employee details for each affiliation
+        const employeesWithDetails = await Promise.all(
+          affiliations.map(async (aff) => {
+            const employee = await usersCollection.findOne(
+              { email: aff.employeeEmail },
+              { projection: { name: 1, email: 1, profileImage: 1, dateOfBirth: 1 } }
+            );
+            return {
+              ...aff,
+              employeeDetails: employee,
+            };
+          })
+        );
+
+        return res.send({
+          success: true,
+          data: employeesWithDetails,
+          pagination: {
+            total: totalCount,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(totalCount / parseInt(limit)),
+          },
+        });
+      } catch (error) {
+        console.error('Error fetching employees:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch employees',
+          error: error.message,
+        });
+      }
+    });
+
+    // Get employee's team (other employees at same companies)
+    app.get('/affiliations/my-team', verifyToken, async (req, res) => {
+      try {
+        const employeeEmail = req.user.email;
+
+        // Get all companies this employee is affiliated with
+        const myAffiliations = await employeeAffiliationsCollection
+          .find({ employeeEmail, status: 'active' })
+          .toArray();
+
+        if (myAffiliations.length === 0) {
+          return res.send({
+            success: true,
+            data: [],
+            message: 'No team affiliations yet',
+          });
+        }
+
+        // Get all team members from these companies
+        const companyEmails = myAffiliations.map(a => a.companyEmail);
+        
+        const teammates = await employeeAffiliationsCollection
+          .find({
+            companyEmail: { $in: companyEmails },
+            employeeEmail: { $ne: employeeEmail },
+            status: 'active',
+          })
+          .toArray();
+
+        // Get details and group by company
+        const teamsWithDetails = await Promise.all(
+          myAffiliations.map(async (aff) => {
+            const companyTeammates = teammates.filter(t => t.companyEmail === aff.companyEmail);
+            
+            const teammatesWithDetails = await Promise.all(
+              companyTeammates.map(async (tm) => {
+                const employee = await usersCollection.findOne(
+                  { email: tm.employeeEmail },
+                  { projection: { name: 1, email: 1, profileImage: 1 } }
+                );
+                return { ...tm, employeeDetails: employee };
+              })
+            );
+
+            // Get HR/company info
+            const hr = await usersCollection.findOne(
+              { email: aff.companyEmail },
+              { projection: { name: 1, companyName: 1, companyLogo: 1 } }
+            );
+
+            return {
+              companyEmail: aff.companyEmail,
+              companyName: aff.companyName,
+              companyLogo: hr?.companyLogo,
+              hrName: hr?.name,
+              teammates: teammatesWithDetails,
+            };
+          })
+        );
+
+        return res.send({
+          success: true,
+          data: teamsWithDetails,
+        });
+      } catch (error) {
+        console.error('Error fetching team:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch team',
+          error: error.message,
+        });
+      }
+    });
+
+    // Remove employee from team (HR only)
+    app.delete('/affiliations/:employeeEmail', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const { employeeEmail } = req.params;
+        const hrEmail = req.user.email;
+
+        const result = await employeeAffiliationsCollection.updateOne(
+          {
+            employeeEmail: decodeURIComponent(employeeEmail),
+            companyEmail: hrEmail,
+          },
+          {
+            $set: {
+              status: 'removed',
+              removedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+          }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).send({
+            success: false,
+            message: 'Affiliation not found',
+          });
+        }
+
+        // Decrement HR's employee count
+        await usersCollection.updateOne(
+          { email: hrEmail },
+          { $inc: { currentEmployees: -1 } }
+        );
+
+        return res.send({
+          success: true,
+          message: 'Employee removed from team',
+        });
+      } catch (error) {
+        console.error('Error removing employee:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to remove employee',
+          error: error.message,
+        });
+      }
+    });
+
+    // Get employee's affiliations (companies they work with)
+    app.get('/affiliations/my-companies', verifyToken, async (req, res) => {
+      try {
+        const employeeEmail = req.user.email;
+
+        const affiliations = await employeeAffiliationsCollection
+          .find({ employeeEmail, status: 'active' })
+          .toArray();
+
+        // Get company details
+        const companiesWithDetails = await Promise.all(
+          affiliations.map(async (aff) => {
+            const hr = await usersCollection.findOne(
+              { email: aff.companyEmail },
+              { projection: { name: 1, companyName: 1, companyLogo: 1 } }
+            );
+            return {
+              ...aff,
+              companyLogo: hr?.companyLogo,
+              hrName: hr?.name,
+            };
+          })
+        );
+
+        return res.send({
+          success: true,
+          data: companiesWithDetails,
+        });
+      } catch (error) {
+        console.error('Error fetching companies:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch companies',
+          error: error.message,
+        });
+      }
+    });
+
     app.get('/', (req, res) => {
       res.send('AssetVerse server is running');
     });

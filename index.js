@@ -92,6 +92,10 @@ async function run() {
     const packagesCollection = db.collection('packages');
     const paymentsCollection = db.collection('payments');
 
+    // Ensure unique payment records to prevent duplicate inserts
+    await paymentsCollection.createIndex({ stripeSessionId: 1 }, { unique: true }).catch(() => {});
+    await paymentsCollection.createIndex({ stripePaymentIntentId: 1 }, { unique: true }).catch(() => {});
+
     await db.command({ ping: 1 });
     console.log('Connected to MongoDB and collections initialized');
 
@@ -1900,6 +1904,389 @@ async function run() {
         return res.status(500).send({
           success: false,
           message: 'Failed to fetch stats',
+          error: error.message,
+        });
+      }
+    });
+
+    // ==================== STRIPE PAYMENT ROUTES ====================
+
+    // Package definitions
+    const PACKAGES = {
+      basic: { name: 'Basic', employeeLimit: 5, price: 5, priceInCents: 500 },
+      standard: { name: 'Standard', employeeLimit: 10, price: 8, priceInCents: 800 },
+      premium: { name: 'Premium', employeeLimit: 20, price: 15, priceInCents: 1500 },
+    };
+
+    // Create Stripe checkout session (HR only)
+    app.post('/create-checkout-session', verifyToken, verifyHR, async (req, res) => {
+      try {
+        if (!stripe) {
+          return res.status(500).send({
+            success: false,
+            message: 'Payment processing is not configured',
+          });
+        }
+
+        const { packageType } = req.body;
+        const hrEmail = req.user.email;
+
+        // Validate package type
+        if (!packageType || !PACKAGES[packageType]) {
+          return res.status(400).send({
+            success: false,
+            message: 'Invalid package type. Choose: basic, standard, or premium',
+          });
+        }
+
+        const selectedPackage = PACKAGES[packageType];
+
+        // Get current HR data
+        const hrUser = await usersCollection.findOne({ email: hrEmail });
+        if (!hrUser) {
+          return res.status(404).send({
+            success: false,
+            message: 'User not found',
+          });
+        }
+
+        // Check if they already have this or better package
+        if (hrUser.packageLimit >= selectedPackage.employeeLimit) {
+          return res.status(400).send({
+            success: false,
+            message: `You already have a package with ${hrUser.packageLimit} employees. Choose a higher tier.`,
+          });
+        }
+
+        // Create Stripe checkout session
+        const session = await stripe.checkout.sessions.create({
+          payment_method_types: ['card'],
+          line_items: [
+            {
+              price_data: {
+                currency: 'usd',
+                product_data: {
+                  name: `AssetVerse ${selectedPackage.name} Package`,
+                  description: `Upgrade to ${selectedPackage.employeeLimit} employee limit`,
+                },
+                unit_amount: selectedPackage.priceInCents,
+              },
+              quantity: 1,
+            },
+          ],
+          mode: 'payment',
+          success_url: `${allowedOrigin}/dashboard/upgrade-package?success=true&session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${allowedOrigin}/dashboard/upgrade-package?canceled=true`,
+          customer_email: hrEmail,
+          metadata: {
+            hrEmail: hrEmail,
+            packageType: packageType,
+            newLimit: selectedPackage.employeeLimit.toString(),
+            packageName: selectedPackage.name,
+          },
+        });
+
+        return res.send({
+          success: true,
+          sessionId: session.id,
+          url: session.url,
+        });
+      } catch (error) {
+        console.error('Error creating checkout session:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to create checkout session',
+          error: error.message,
+        });
+      }
+    });
+
+    // Verify payment and update package (called after successful payment)
+    app.post('/verify-payment', verifyToken, verifyHR, async (req, res) => {
+      try {
+        if (!stripe) {
+          return res.status(500).send({
+            success: false,
+            message: 'Payment processing is not configured',
+          });
+        }
+
+        const { sessionId } = req.body;
+        const hrEmail = req.user.email;
+
+        if (!sessionId) {
+          return res.status(400).send({
+            success: false,
+            message: 'Session ID is required',
+          });
+        }
+
+        // Retrieve the session from Stripe
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+        // Verify the session
+        if (session.payment_status !== 'paid') {
+          return res.status(400).send({
+            success: false,
+            message: 'Payment not completed',
+          });
+        }
+
+        // Verify the email matches
+        if (session.metadata.hrEmail !== hrEmail) {
+          return res.status(403).send({
+            success: false,
+            message: 'Payment session does not belong to this user',
+          });
+        }
+
+        // Check if this payment was already processed
+        const existingPayment = await paymentsCollection.findOne({
+          stripeSessionId: sessionId,
+        });
+
+        if (existingPayment) {
+          return res.send({
+            success: true,
+            message: 'Payment already processed',
+            alreadyProcessed: true,
+            data: {
+              packageName: existingPayment.packageName,
+              newLimit: existingPayment.newLimit,
+            },
+          });
+        }
+
+        const packageType = session.metadata.packageType;
+        const newLimit = parseInt(session.metadata.newLimit);
+        const packageName = session.metadata.packageName;
+
+        // Update HR's package limit
+        await usersCollection.updateOne(
+          { email: hrEmail },
+          {
+            $set: {
+              packageLimit: newLimit,
+              packageName: packageName,
+              packageType: packageType,
+              lastUpgradedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+          }
+        );
+
+        // Record the payment (guard against duplicate insert if endpoint called twice)
+        try {
+          await paymentsCollection.insertOne({
+            hrEmail: hrEmail,
+            stripeSessionId: sessionId,
+            stripePaymentIntentId: session.payment_intent,
+            packageType: packageType,
+            packageName: packageName,
+            newLimit: newLimit,
+            amountPaid: session.amount_total / 100, // Convert cents to dollars
+            currency: session.currency,
+            status: 'completed',
+            paidAt: new Date().toISOString(),
+            createdAt: new Date().toISOString(),
+          });
+        } catch (err) {
+          // Duplicate key (already processed)
+          if (err.code === 11000) {
+            return res.send({
+              success: true,
+              message: 'Payment already processed',
+              alreadyProcessed: true,
+              data: {
+                packageName: packageName,
+                newLimit: newLimit,
+              },
+            });
+          }
+          throw err;
+        }
+
+        return res.send({
+          success: true,
+          message: 'Package upgraded successfully',
+          data: {
+            packageName: packageName,
+            newLimit: newLimit,
+          },
+        });
+      } catch (error) {
+        console.error('Error verifying payment:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to verify payment',
+          error: error.message,
+        });
+      }
+    });
+
+    // Get payment history (HR only)
+    app.get('/payments/history', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const hrEmail = req.user.email;
+
+        const payments = await paymentsCollection
+          .find({ hrEmail })
+          .sort({ paidAt: -1 })
+          .toArray();
+
+        return res.send({
+          success: true,
+          data: payments,
+        });
+      } catch (error) {
+        console.error('Error fetching payment history:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch payment history',
+          error: error.message,
+        });
+      }
+    });
+
+    // Request refund (HR only) - reverts package to previous state
+    app.post('/payments/:paymentId/refund', verifyToken, verifyHR, async (req, res) => {
+      try {
+        if (!stripe) {
+          return res.status(500).send({
+            success: false,
+            message: 'Payment processing is not configured',
+          });
+        }
+
+        const { paymentId } = req.params;
+        const hrEmail = req.user.email;
+        const { ObjectId } = require('mongodb');
+
+        // Find the payment
+        const payment = await paymentsCollection.findOne({
+          _id: new ObjectId(paymentId),
+          hrEmail: hrEmail,
+        });
+
+        if (!payment) {
+          return res.status(404).send({
+            success: false,
+            message: 'Payment not found',
+          });
+        }
+
+        if (payment.status === 'refunded') {
+          return res.status(400).send({
+            success: false,
+            message: 'This payment has already been refunded',
+          });
+        }
+
+        // Check if user has employees that would exceed the lower limit
+        const hrUser = await usersCollection.findOne({ email: hrEmail });
+        
+        // Determine the previous package limit (the one before this upgrade)
+        // Find the payment before this one, or default to 5 (Basic)
+        const previousPayment = await paymentsCollection.findOne(
+          { 
+            hrEmail, 
+            paidAt: { $lt: payment.paidAt },
+            status: 'completed'
+          },
+          { sort: { paidAt: -1 } }
+        );
+        
+        const previousLimit = previousPayment ? previousPayment.newLimit : 5;
+        const previousPackageName = previousPayment ? previousPayment.packageName : 'Basic';
+        const previousPackageType = previousPayment ? previousPayment.packageType : 'basic';
+
+        // Check if current employees exceed previous limit
+        if (hrUser.currentEmployees > previousLimit) {
+          return res.status(400).send({
+            success: false,
+            message: `Cannot refund: You have ${hrUser.currentEmployees} employees but the previous package only allows ${previousLimit}. Please remove some employees first.`,
+          });
+        }
+
+        // Process refund through Stripe
+        const refund = await stripe.refunds.create({
+          payment_intent: payment.stripePaymentIntentId,
+        });
+
+        // Update payment record
+        await paymentsCollection.updateOne(
+          { _id: new ObjectId(paymentId) },
+          {
+            $set: {
+              status: 'refunded',
+              refundedAt: new Date().toISOString(),
+              stripeRefundId: refund.id,
+              previousLimit: payment.newLimit, // Store what the limit was
+              revertedToLimit: previousLimit,
+              updatedAt: new Date().toISOString(),
+            },
+          }
+        );
+
+        // Revert user's package limit to previous state
+        await usersCollection.updateOne(
+          { email: hrEmail },
+          {
+            $set: {
+              packageLimit: previousLimit,
+              packageName: previousPackageName,
+              packageType: previousPackageType,
+              lastRefundedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+          }
+        );
+
+        return res.send({
+          success: true,
+          message: 'Refund processed successfully',
+          data: {
+            refundId: refund.id,
+            previousLimit: previousLimit,
+            packageName: previousPackageName,
+          },
+        });
+      } catch (error) {
+        console.error('Error processing refund:', error);
+        
+        // Handle Stripe-specific errors
+        if (error.type === 'StripeInvalidRequestError') {
+          return res.status(400).send({
+            success: false,
+            message: error.message || 'Stripe refund failed',
+          });
+        }
+
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to process refund',
+          error: error.message,
+        });
+      }
+    });
+
+    // Get available packages
+    app.get('/packages/available', verifyToken, async (req, res) => {
+      try {
+        const packages = Object.entries(PACKAGES).map(([key, value]) => ({
+          id: key,
+          ...value,
+        }));
+
+        return res.send({
+          success: true,
+          data: packages,
+        });
+      } catch (error) {
+        console.error('Error fetching packages:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch packages',
           error: error.message,
         });
       }

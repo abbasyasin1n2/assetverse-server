@@ -1137,6 +1137,104 @@ async function run() {
       }
     });
 
+    // Direct assignment (HR only) to already-affiliated employees
+    app.post('/assets/:id/assign', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { employeeEmail, notes } = req.body;
+        const hrEmail = req.user.email;
+        const { ObjectId } = require('mongodb');
+
+        if (!employeeEmail) {
+          return res.status(400).send({
+            success: false,
+            message: 'Employee email is required',
+          });
+        }
+
+        const employee = await usersCollection.findOne({ email: employeeEmail });
+        if (!employee || employee.role !== 'employee') {
+          return res.status(404).send({
+            success: false,
+            message: 'Employee not found',
+          });
+        }
+
+        // Ensure employee is already affiliated with this HR/company
+        const affiliation = await employeeAffiliationsCollection.findOne({
+          employeeEmail,
+          companyEmail: hrEmail,
+          status: 'active',
+        });
+
+        if (!affiliation) {
+          return res.status(400).send({
+            success: false,
+            message: 'Employee is not affiliated with your company. Approve a request first.',
+          });
+        }
+
+        // Get asset and ensure it belongs to this HR and has stock
+        const asset = await assetsCollection.findOne({ _id: new ObjectId(id), companyEmail: hrEmail });
+        if (!asset) {
+          return res.status(404).send({
+            success: false,
+            message: 'Asset not found for this company',
+          });
+        }
+
+        if (asset.availableQuantity < 1) {
+          return res.status(400).send({
+            success: false,
+            message: 'Asset is no longer available',
+          });
+        }
+
+        // Create an approved request entry for traceability
+        const now = new Date().toISOString();
+        const approvedRequest = {
+          assetId: new ObjectId(id),
+          assetName: asset.name,
+          assetType: asset.type,
+          assetImage: asset.image,
+          employeeEmail,
+          employeeName: employee.name,
+          companyEmail: hrEmail,
+          companyName: asset.companyName,
+          message: notes || 'Direct assignment by HR',
+          notes: notes || 'Direct assignment by HR',
+          urgency: 'normal',
+          status: 'approved',
+          requestDate: now,
+          approvedDate: now,
+          approvedBy: hrEmail,
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        const insertResult = await requestsCollection.insertOne(approvedRequest);
+
+        // Decrease available quantity
+        await assetsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $inc: { availableQuantity: -1 }, $set: { updatedAt: now } }
+        );
+
+        return res.send({
+          success: true,
+          message: 'Asset assigned successfully',
+          requestId: insertResult.insertedId,
+        });
+      } catch (error) {
+        console.error('Error assigning asset directly:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to assign asset',
+          error: error.message,
+        });
+      }
+    });
+
     // Get employee's assigned assets (My Assets page)
     app.get('/my-assets', verifyToken, async (req, res) => {
       try {
@@ -1654,7 +1752,7 @@ async function run() {
 
         const teamMembers = await usersCollection
           .find(userQuery)
-          .project({ name: 1, email: 1, role: 1, profileImage: 1, designation: 1, companyName: 1 })
+          .project({ name: 1, email: 1, role: 1, profileImage: 1, designation: 1, companyName: 1, dateOfBirth: 1 })
           .skip(skip)
           .limit(parseInt(limit))
           .toArray();

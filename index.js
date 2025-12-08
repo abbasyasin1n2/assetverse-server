@@ -37,13 +37,14 @@ app.use(
     credentials: true,
   })
 );
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 
+const isProduction = process.env.NODE_ENV === 'production';
 const cookieOptions = {
   httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'none',
+  secure: isProduction,
+  sameSite: isProduction ? 'none' : 'lax',
   maxAge: 7 * 24 * 60 * 60 * 1000,
 };
 
@@ -246,35 +247,38 @@ async function run() {
       }
     });
 
-    // Direct upload endpoint (server-side upload)
-    app.post('/cloudinary/upload', express.raw({ type: 'application/octet-stream', limit: '10mb' }), async (req, res) => {
+    // Direct upload endpoint (JSON with base64)
+    app.post('/cloudinary/upload', async (req, res) => {
       try {
-        const { folder } = req.query;
+        const { file, folder } = req.body;
         
+        if (!file) {
+          return res.status(400).send({
+            success: false,
+            message: 'No file provided',
+          });
+        }
+
         const allowedFolders = [
           'assetverse/assets',
           'assetverse/companies',
           'assetverse/employees',
         ];
-        if (!folder || !allowedFolders.includes(folder)) {
-          return res.status(400).send({
-            success: false,
-            message: `Invalid folder. Allowed: ${allowedFolders.join(', ')}`,
-          });
-        }
+        
+        const uploadFolder = folder && allowedFolders.includes(folder) 
+          ? folder 
+          : 'assetverse/assets';
 
-        // For testing purposes - upload a sample image
-        const result = await cloudinary.uploader.upload(
-          'data:image/png;base64,' + req.body.toString('base64'),
-          {
-            folder,
-            resource_type: 'auto',
-          }
-        );
+        // Upload base64 image to Cloudinary
+        const result = await cloudinary.uploader.upload(file, {
+          folder: uploadFolder,
+          resource_type: 'auto',
+        });
 
         return res.send({
           success: true,
           message: 'Image uploaded successfully',
+          url: result.secure_url,
           data: {
             publicId: result.public_id,
             url: result.secure_url,

@@ -46,6 +46,7 @@ const cookieOptions = {
   secure: isProduction,
   sameSite: isProduction ? 'none' : 'lax',
   maxAge: 7 * 24 * 60 * 60 * 1000,
+  path: '/',
 };
 
 const verifyToken = (req, res, next) => {
@@ -131,7 +132,12 @@ async function run() {
 
     // Logout clears the auth cookie
     app.post('/logout', (req, res) => {
-      res.clearCookie('token', { ...cookieOptions, maxAge: 0 });
+      res.clearCookie('token', {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: isProduction ? 'none' : 'lax',
+        path: '/',
+      });
       return res.send({ success: true });
     });
 
@@ -635,9 +641,13 @@ async function run() {
         const { search, type, category, status, sort, page = 1, limit = 10 } = req.query;
         const userEmail = req.user.email;
 
+        console.log('GET /assets - User email from token:', userEmail);
+
         // Get user to check role
         const user = await usersCollection.findOne({ email: userEmail });
         
+        console.log('GET /assets - User from DB:', user?.email, user?.role);
+
         // Build query based on role
         let query = {};
         
@@ -650,13 +660,24 @@ async function run() {
           query.status = 'available';
         }
 
-        // Search filter
+        // Search filter - use $and to combine with existing filters
         if (search) {
-          query.$or = [
-            { name: { $regex: search, $options: 'i' } },
-            { category: { $regex: search, $options: 'i' } },
+          query.$and = [
+            { companyEmail: query.companyEmail },
+            {
+              $or: [
+                { name: { $regex: search, $options: 'i' } },
+                { category: { $regex: search, $options: 'i' } },
+              ],
+            },
           ];
+          // Remove the separate companyEmail since it's now in $and
+          if (user?.role === 'hr') {
+            delete query.companyEmail;
+          }
         }
+        
+        console.log('GET /assets - Final query:', JSON.stringify(query));
 
         // Type filter (returnable/non-returnable)
         if (type && type !== 'all') {

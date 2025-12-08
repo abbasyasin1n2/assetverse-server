@@ -402,16 +402,39 @@ async function run() {
 
         updateData.updatedAt = new Date().toISOString();
 
+        // Get the user to check their role
+        const user = await usersCollection.findOne({ email });
+        if (!user) {
+          return res.status(404).send({ 
+            success: false, 
+            message: 'User not found' 
+          });
+        }
+
         const result = await usersCollection.updateOne(
           { email },
           { $set: updateData }
         );
 
-        if (result.matchedCount === 0) {
-          return res.status(404).send({ 
-            success: false, 
-            message: 'User not found' 
-          });
+        // If HR updates their company name, sync it across related collections
+        if (user.role === 'hr' && updateData.companyName) {
+          // Update company name in all employee affiliations
+          await employeeAffiliationsCollection.updateMany(
+            { companyEmail: email },
+            { $set: { companyName: updateData.companyName, updatedAt: new Date().toISOString() } }
+          );
+
+          // Update company name in all assets
+          await assetsCollection.updateMany(
+            { companyEmail: email },
+            { $set: { companyName: updateData.companyName, updatedAt: new Date().toISOString() } }
+          );
+
+          // Update company name in all requests
+          await requestsCollection.updateMany(
+            { companyEmail: email },
+            { $set: { companyName: updateData.companyName, updatedAt: new Date().toISOString() } }
+          );
         }
 
         return res.send({
@@ -1222,13 +1245,14 @@ async function run() {
           }
         );
 
-        // Create employee affiliation if not exists
+        // Create or reactivate employee affiliation
         const existingAffiliation = await employeeAffiliationsCollection.findOne({
           employeeEmail: request.employeeEmail,
           companyEmail: hrEmail,
         });
 
         if (!existingAffiliation) {
+          // No affiliation exists - create new one
           await employeeAffiliationsCollection.insertOne({
             employeeEmail: request.employeeEmail,
             employeeName: request.employeeName,
@@ -1241,6 +1265,26 @@ async function run() {
           });
 
           // Increment HR's employee count
+          await usersCollection.updateOne(
+            { email: hrEmail },
+            { $inc: { currentEmployees: 1 } }
+          );
+        } else if (existingAffiliation.status !== 'active') {
+          // Affiliation exists but inactive/removed - reactivate it
+          await employeeAffiliationsCollection.updateOne(
+            { _id: existingAffiliation._id },
+            {
+              $set: {
+                status: 'active',
+                employeeName: request.employeeName, // Update name in case it changed
+                reaffiliatedAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              },
+              $unset: { removedAt: '' }, // Remove the removedAt field
+            }
+          );
+
+          // Increment HR's employee count (they were decremented when removed)
           await usersCollection.updateOne(
             { email: hrEmail },
             { $inc: { currentEmployees: 1 } }
@@ -1685,7 +1729,7 @@ async function run() {
           .find({ employeeEmail, status: 'active' })
           .toArray();
 
-        // Get company details
+        // Get company details - always use the latest from HR's profile
         const companiesWithDetails = await Promise.all(
           affiliations.map(async (aff) => {
             const hr = await usersCollection.findOne(
@@ -1694,6 +1738,8 @@ async function run() {
             );
             return {
               ...aff,
+              // Use HR's current company name (source of truth)
+              companyName: hr?.companyName || aff.companyName,
               companyLogo: hr?.companyLogo,
               hrName: hr?.name,
             };

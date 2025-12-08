@@ -867,6 +867,439 @@ async function run() {
       }
     });
 
+    // ============ REQUESTS ROUTES ============
+
+    // Create asset request (Employee)
+    app.post('/requests', verifyToken, async (req, res) => {
+      try {
+        const { assetId, notes, urgency } = req.body;
+        const employeeEmail = req.user.email;
+        const { ObjectId } = require('mongodb');
+
+        // Get employee info
+        const employee = await usersCollection.findOne({ email: employeeEmail });
+        if (!employee || employee.role !== 'employee') {
+          return res.status(403).send({
+            success: false,
+            message: 'Only employees can request assets',
+          });
+        }
+
+        // Get asset info
+        const asset = await assetsCollection.findOne({ _id: new ObjectId(assetId) });
+        if (!asset) {
+          return res.status(404).send({
+            success: false,
+            message: 'Asset not found',
+          });
+        }
+
+        // Check if asset is available
+        if (asset.availableQuantity < 1) {
+          return res.status(400).send({
+            success: false,
+            message: 'Asset is not available',
+          });
+        }
+
+        // Check for duplicate pending request
+        const existingRequest = await requestsCollection.findOne({
+          assetId: new ObjectId(assetId),
+          employeeEmail,
+          status: 'pending',
+        });
+
+        if (existingRequest) {
+          return res.status(400).send({
+            success: false,
+            message: 'You already have a pending request for this asset',
+          });
+        }
+
+        // Create request
+        const requestDoc = {
+          assetId: new ObjectId(assetId),
+          assetName: asset.name,
+          assetType: asset.type,
+          assetImage: asset.image,
+          employeeEmail,
+          employeeName: employee.name,
+          companyEmail: asset.companyEmail,
+          companyName: asset.companyName,
+          notes: notes || '',
+          urgency: urgency || 'normal',
+          status: 'pending',
+          requestDate: new Date().toISOString(),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+
+        const result = await requestsCollection.insertOne(requestDoc);
+
+        return res.status(201).send({
+          success: true,
+          message: 'Request submitted successfully',
+          insertedId: result.insertedId,
+        });
+      } catch (error) {
+        console.error('Error creating request:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to create request',
+          error: error.message,
+        });
+      }
+    });
+
+    // Get requests (role-based: HR sees company requests, Employee sees own)
+    app.get('/requests', verifyToken, async (req, res) => {
+      try {
+        const { status, search, page = 1, limit = 10 } = req.query;
+        const userEmail = req.user.email;
+        const user = await usersCollection.findOne({ email: userEmail });
+
+        let query = {};
+
+        if (user?.role === 'hr') {
+          // HR sees requests for their company's assets
+          query.companyEmail = userEmail;
+        } else {
+          // Employee sees their own requests
+          query.employeeEmail = userEmail;
+        }
+
+        // Status filter
+        if (status && status !== 'all') {
+          query.status = status;
+        }
+
+        // Search filter
+        if (search) {
+          query.$or = [
+            { assetName: { $regex: search, $options: 'i' } },
+            { employeeName: { $regex: search, $options: 'i' } },
+          ];
+        }
+
+        // Pagination
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const totalCount = await requestsCollection.countDocuments(query);
+
+        const requests = await requestsCollection
+          .find(query)
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        return res.send({
+          success: true,
+          data: requests,
+          pagination: {
+            total: totalCount,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(totalCount / parseInt(limit)),
+          },
+        });
+      } catch (error) {
+        console.error('Error fetching requests:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch requests',
+          error: error.message,
+        });
+      }
+    });
+
+    // Approve request (HR only)
+    app.patch('/requests/:id/approve', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const hrEmail = req.user.email;
+        const { ObjectId } = require('mongodb');
+
+        // Get the request
+        const request = await requestsCollection.findOne({
+          _id: new ObjectId(id),
+          companyEmail: hrEmail,
+          status: 'pending',
+        });
+
+        if (!request) {
+          return res.status(404).send({
+            success: false,
+            message: 'Request not found or already processed',
+          });
+        }
+
+        // Get the asset
+        const asset = await assetsCollection.findOne({ _id: request.assetId });
+        if (!asset || asset.availableQuantity < 1) {
+          return res.status(400).send({
+            success: false,
+            message: 'Asset is no longer available',
+          });
+        }
+
+        // Update request status
+        await requestsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              status: 'approved',
+              approvedDate: new Date().toISOString(),
+              approvedBy: hrEmail,
+              updatedAt: new Date().toISOString(),
+            },
+          }
+        );
+
+        // Decrease available quantity
+        await assetsCollection.updateOne(
+          { _id: request.assetId },
+          {
+            $inc: { availableQuantity: -1 },
+            $set: { updatedAt: new Date().toISOString() },
+          }
+        );
+
+        // Create employee affiliation if not exists
+        const existingAffiliation = await employeeAffiliationsCollection.findOne({
+          employeeEmail: request.employeeEmail,
+          companyEmail: hrEmail,
+        });
+
+        if (!existingAffiliation) {
+          await employeeAffiliationsCollection.insertOne({
+            employeeEmail: request.employeeEmail,
+            employeeName: request.employeeName,
+            companyEmail: hrEmail,
+            companyName: request.companyName,
+            status: 'active',
+            affiliatedAt: new Date().toISOString(),
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          });
+
+          // Increment HR's employee count
+          await usersCollection.updateOne(
+            { email: hrEmail },
+            { $inc: { currentEmployees: 1 } }
+          );
+        }
+
+        return res.send({
+          success: true,
+          message: 'Request approved successfully',
+        });
+      } catch (error) {
+        console.error('Error approving request:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to approve request',
+          error: error.message,
+        });
+      }
+    });
+
+    // Reject request (HR only)
+    app.patch('/requests/:id/reject', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { reason } = req.body;
+        const hrEmail = req.user.email;
+        const { ObjectId } = require('mongodb');
+
+        const result = await requestsCollection.updateOne(
+          {
+            _id: new ObjectId(id),
+            companyEmail: hrEmail,
+            status: 'pending',
+          },
+          {
+            $set: {
+              status: 'rejected',
+              rejectedDate: new Date().toISOString(),
+              rejectedBy: hrEmail,
+              rejectionReason: reason || 'No reason provided',
+              updatedAt: new Date().toISOString(),
+            },
+          }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).send({
+            success: false,
+            message: 'Request not found or already processed',
+          });
+        }
+
+        return res.send({
+          success: true,
+          message: 'Request rejected',
+        });
+      } catch (error) {
+        console.error('Error rejecting request:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to reject request',
+          error: error.message,
+        });
+      }
+    });
+
+    // Return asset (Employee returns approved asset)
+    app.patch('/requests/:id/return', verifyToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const employeeEmail = req.user.email;
+        const { ObjectId } = require('mongodb');
+
+        // Get the request
+        const request = await requestsCollection.findOne({
+          _id: new ObjectId(id),
+          employeeEmail,
+          status: 'approved',
+        });
+
+        if (!request) {
+          return res.status(404).send({
+            success: false,
+            message: 'Request not found or not approved',
+          });
+        }
+
+        // Check if asset is returnable
+        if (request.assetType !== 'returnable') {
+          return res.status(400).send({
+            success: false,
+            message: 'This asset is non-returnable',
+          });
+        }
+
+        // Update request status
+        await requestsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              status: 'returned',
+              returnedDate: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+          }
+        );
+
+        // Increase available quantity
+        await assetsCollection.updateOne(
+          { _id: request.assetId },
+          {
+            $inc: { availableQuantity: 1 },
+            $set: { updatedAt: new Date().toISOString() },
+          }
+        );
+
+        return res.send({
+          success: true,
+          message: 'Asset returned successfully',
+        });
+      } catch (error) {
+        console.error('Error returning asset:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to return asset',
+          error: error.message,
+        });
+      }
+    });
+
+    // Cancel request (Employee cancels own pending request)
+    app.patch('/requests/:id/cancel', verifyToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const employeeEmail = req.user.email;
+        const { ObjectId } = require('mongodb');
+
+        const result = await requestsCollection.updateOne(
+          {
+            _id: new ObjectId(id),
+            employeeEmail,
+            status: 'pending',
+          },
+          {
+            $set: {
+              status: 'cancelled',
+              cancelledDate: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+          }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).send({
+            success: false,
+            message: 'Request not found or cannot be cancelled',
+          });
+        }
+
+        return res.send({
+          success: true,
+          message: 'Request cancelled',
+        });
+      } catch (error) {
+        console.error('Error cancelling request:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to cancel request',
+          error: error.message,
+        });
+      }
+    });
+
+    // Get request statistics for HR
+    app.get('/requests/stats/summary', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const hrEmail = req.user.email;
+
+        const stats = await requestsCollection.aggregate([
+          { $match: { companyEmail: hrEmail } },
+          {
+            $group: {
+              _id: '$status',
+              count: { $sum: 1 },
+            },
+          },
+        ]).toArray();
+
+        // Convert to object
+        const summary = {
+          pending: 0,
+          approved: 0,
+          rejected: 0,
+          returned: 0,
+          cancelled: 0,
+          total: 0,
+        };
+
+        stats.forEach(s => {
+          summary[s._id] = s.count;
+          summary.total += s.count;
+        });
+
+        return res.send({
+          success: true,
+          summary,
+        });
+      } catch (error) {
+        console.error('Error fetching request stats:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch request statistics',
+          error: error.message,
+        });
+      }
+    });
+
     app.get('/', (req, res) => {
       res.send('AssetVerse server is running');
     });

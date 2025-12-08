@@ -571,6 +571,302 @@ async function run() {
       }
     });
 
+    // ============ ASSETS ROUTES ============
+
+    // Create a new asset (HR only)
+    app.post('/assets', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const assetData = req.body;
+        const hrEmail = req.user.email;
+
+        // Get HR's company info
+        const hrUser = await usersCollection.findOne({ email: hrEmail });
+        if (!hrUser) {
+          return res.status(404).send({
+            success: false,
+            message: 'HR user not found',
+          });
+        }
+
+        // Validate required fields
+        if (!assetData.name || !assetData.type) {
+          return res.status(400).send({
+            success: false,
+            message: 'Missing required fields: name, type',
+          });
+        }
+
+        // Build asset document
+        const assetToInsert = {
+          ...assetData,
+          companyEmail: hrEmail,
+          companyName: hrUser.companyName,
+          quantity: assetData.quantity || 1,
+          availableQuantity: assetData.availableQuantity ?? assetData.quantity ?? 1,
+          status: assetData.status || 'available',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+
+        const result = await assetsCollection.insertOne(assetToInsert);
+
+        return res.status(201).send({
+          success: true,
+          message: 'Asset created successfully',
+          insertedId: result.insertedId,
+        });
+      } catch (error) {
+        console.error('Error creating asset:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to create asset',
+          error: error.message,
+        });
+      }
+    });
+
+    // Get all assets for HR's company (with search, filter, pagination)
+    app.get('/assets', verifyToken, async (req, res) => {
+      try {
+        const { search, type, status, sort, page = 1, limit = 10 } = req.query;
+        const userEmail = req.user.email;
+
+        // Get user to check role
+        const user = await usersCollection.findOne({ email: userEmail });
+        
+        // Build query based on role
+        let query = {};
+        
+        if (user?.role === 'hr') {
+          // HR sees their company's assets
+          query.companyEmail = userEmail;
+        } else {
+          // Employee sees assets from companies they're affiliated with
+          // For now, show all available assets (will refine with affiliations later)
+          query.status = 'available';
+        }
+
+        // Search filter
+        if (search) {
+          query.$or = [
+            { name: { $regex: search, $options: 'i' } },
+            { category: { $regex: search, $options: 'i' } },
+          ];
+        }
+
+        // Type filter (returnable/non-returnable)
+        if (type && type !== 'all') {
+          query.type = type;
+        }
+
+        // Status filter
+        if (status && status !== 'all') {
+          query.status = status;
+        }
+
+        // Sorting
+        let sortOption = { createdAt: -1 }; // Default: newest first
+        if (sort === 'name-asc') sortOption = { name: 1 };
+        if (sort === 'name-desc') sortOption = { name: -1 };
+        if (sort === 'quantity-asc') sortOption = { quantity: 1 };
+        if (sort === 'quantity-desc') sortOption = { quantity: -1 };
+
+        // Pagination
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const totalCount = await assetsCollection.countDocuments(query);
+
+        const assets = await assetsCollection
+          .find(query)
+          .sort(sortOption)
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        return res.send({
+          success: true,
+          data: assets,
+          pagination: {
+            total: totalCount,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(totalCount / parseInt(limit)),
+          },
+        });
+      } catch (error) {
+        console.error('Error fetching assets:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch assets',
+          error: error.message,
+        });
+      }
+    });
+
+    // Get single asset by ID
+    app.get('/assets/:id', verifyToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { ObjectId } = require('mongodb');
+
+        const asset = await assetsCollection.findOne({ _id: new ObjectId(id) });
+
+        if (!asset) {
+          return res.status(404).send({
+            success: false,
+            message: 'Asset not found',
+          });
+        }
+
+        return res.send(asset);
+      } catch (error) {
+        console.error('Error fetching asset:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch asset',
+          error: error.message,
+        });
+      }
+    });
+
+    // Update asset (HR only)
+    app.patch('/assets/:id', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const updateData = req.body;
+        const hrEmail = req.user.email;
+        const { ObjectId } = require('mongodb');
+
+        // Verify the asset belongs to this HR's company
+        const existingAsset = await assetsCollection.findOne({
+          _id: new ObjectId(id),
+          companyEmail: hrEmail,
+        });
+
+        if (!existingAsset) {
+          return res.status(404).send({
+            success: false,
+            message: 'Asset not found or unauthorized',
+          });
+        }
+
+        // Don't allow changing company info
+        delete updateData.companyEmail;
+        delete updateData.companyName;
+        delete updateData._id;
+
+        updateData.updatedAt = new Date().toISOString();
+
+        const result = await assetsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateData }
+        );
+
+        return res.send({
+          success: true,
+          message: 'Asset updated successfully',
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        console.error('Error updating asset:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to update asset',
+          error: error.message,
+        });
+      }
+    });
+
+    // Delete asset (HR only)
+    app.delete('/assets/:id', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const hrEmail = req.user.email;
+        const { ObjectId } = require('mongodb');
+
+        // Verify the asset belongs to this HR's company
+        const result = await assetsCollection.deleteOne({
+          _id: new ObjectId(id),
+          companyEmail: hrEmail,
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).send({
+            success: false,
+            message: 'Asset not found or unauthorized',
+          });
+        }
+
+        return res.send({
+          success: true,
+          message: 'Asset deleted successfully',
+        });
+      } catch (error) {
+        console.error('Error deleting asset:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to delete asset',
+          error: error.message,
+        });
+      }
+    });
+
+    // Get asset statistics for HR dashboard
+    app.get('/assets/stats/summary', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const hrEmail = req.user.email;
+
+        const stats = await assetsCollection.aggregate([
+          { $match: { companyEmail: hrEmail } },
+          {
+            $group: {
+              _id: null,
+              totalAssets: { $sum: 1 },
+              totalQuantity: { $sum: '$quantity' },
+              availableQuantity: { $sum: '$availableQuantity' },
+              returnableCount: {
+                $sum: { $cond: [{ $eq: ['$type', 'returnable'] }, 1, 0] },
+              },
+              nonReturnableCount: {
+                $sum: { $cond: [{ $eq: ['$type', 'non-returnable'] }, 1, 0] },
+              },
+            },
+          },
+        ]).toArray();
+
+        // Get assets by category
+        const byCategory = await assetsCollection.aggregate([
+          { $match: { companyEmail: hrEmail } },
+          {
+            $group: {
+              _id: '$category',
+              count: { $sum: 1 },
+              totalQuantity: { $sum: '$quantity' },
+            },
+          },
+          { $sort: { count: -1 } },
+        ]).toArray();
+
+        return res.send({
+          success: true,
+          summary: stats[0] || {
+            totalAssets: 0,
+            totalQuantity: 0,
+            availableQuantity: 0,
+            returnableCount: 0,
+            nonReturnableCount: 0,
+          },
+          byCategory,
+        });
+      } catch (error) {
+        console.error('Error fetching asset stats:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch asset statistics',
+          error: error.message,
+        });
+      }
+    });
+
     app.get('/', (req, res) => {
       res.send('AssetVerse server is running');
     });

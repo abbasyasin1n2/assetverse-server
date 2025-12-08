@@ -641,12 +641,8 @@ async function run() {
         const { search, type, category, status, sort, page = 1, limit = 10 } = req.query;
         const userEmail = req.user.email;
 
-        console.log('GET /assets - User email from token:', userEmail);
-
         // Get user to check role
         const user = await usersCollection.findOne({ email: userEmail });
-        
-        console.log('GET /assets - User from DB:', user?.email, user?.role);
 
         // Build query based on role
         let query = {};
@@ -676,8 +672,6 @@ async function run() {
             delete query.companyEmail;
           }
         }
-        
-        console.log('GET /assets - Final query:', JSON.stringify(query));
 
         // Type filter (returnable/non-returnable)
         if (type && type !== 'all') {
@@ -732,11 +726,83 @@ async function run() {
       }
     });
 
+    // Get available assets for employees (Request Asset page)
+    // IMPORTANT: This route MUST be before /assets/:id to avoid route collision
+    app.get('/assets/available', verifyToken, async (req, res) => {
+      try {
+        const { search, type, category, page = 1, limit = 12 } = req.query;
+
+        // Build query conditions
+        const conditions = [];
+
+        // Must have available quantity
+        conditions.push({
+          $or: [
+            { availableQuantity: { $gt: 0 } },
+            { quantity: { $gt: 0 }, availableQuantity: { $exists: false } },
+          ],
+        });
+
+        // Type filter
+        if (type) {
+          conditions.push({ type: type });
+        }
+
+        // Category filter
+        if (category) {
+          conditions.push({ category: category });
+        }
+
+        // Search filter
+        if (search) {
+          conditions.push({ name: { $regex: search, $options: 'i' } });
+        }
+
+        const query = conditions.length > 0 ? { $and: conditions } : {};
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const totalCount = await assetsCollection.countDocuments(query);
+
+        const assets = await assetsCollection
+          .find(query)
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        return res.send({
+          success: true,
+          data: assets,
+          pagination: {
+            total: totalCount,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(totalCount / parseInt(limit)),
+          },
+        });
+      } catch (error) {
+        console.error('Error fetching available assets:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch assets',
+          error: error.message,
+        });
+      }
+    });
+
     // Get single asset by ID
     app.get('/assets/:id', verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
         const { ObjectId } = require('mongodb');
+
+        // Validate ObjectId format (24 hex characters)
+        if (!id || !/^[0-9a-fA-F]{24}$/.test(id)) {
+          return res.status(400).send({
+            success: false,
+            message: 'Invalid asset ID format',
+          });
+        }
 
         const asset = await assetsCollection.findOne({ _id: new ObjectId(id) });
 
@@ -902,7 +968,8 @@ async function run() {
     // Create asset request (Employee)
     app.post('/requests', verifyToken, async (req, res) => {
       try {
-        const { assetId, notes, urgency } = req.body;
+        const { assetId, notes, message, urgency } = req.body;
+        const requestMessage = message || notes || '';
         const employeeEmail = req.user.email;
         const { ObjectId } = require('mongodb');
 
@@ -956,7 +1023,8 @@ async function run() {
           employeeName: employee.name,
           companyEmail: asset.companyEmail,
           companyName: asset.companyName,
-          notes: notes || '',
+          message: requestMessage,
+          notes: requestMessage,
           urgency: urgency || 'normal',
           status: 'pending',
           requestDate: new Date().toISOString(),
@@ -1041,6 +1109,66 @@ async function run() {
         });
       }
     });
+
+    // Get employee's assigned assets (My Assets page)
+    app.get('/my-assets', verifyToken, async (req, res) => {
+      try {
+        const { search, type, status, page = 1, limit = 10 } = req.query;
+        const employeeEmail = req.user.email;
+
+        let query = {
+          employeeEmail,
+          status: { $in: ['approved', 'returned'] }, // Show approved and returned assets
+        };
+
+        // Status filter
+        if (status) {
+          query.status = status;
+        }
+
+        // Type filter
+        if (type) {
+          query.assetType = type;
+        }
+
+        // Search filter
+        if (search) {
+          query.$or = [
+            { assetName: { $regex: search, $options: 'i' } },
+            { companyName: { $regex: search, $options: 'i' } },
+          ];
+        }
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const totalCount = await requestsCollection.countDocuments(query);
+
+        const assets = await requestsCollection
+          .find(query)
+          .sort({ updatedAt: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        return res.send({
+          success: true,
+          data: assets,
+          pagination: {
+            total: totalCount,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(totalCount / parseInt(limit)),
+          },
+        });
+      } catch (error) {
+        console.error('Error fetching my assets:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch assets',
+          error: error.message,
+        });
+      }
+    });
+
 
     // Approve request (HR only)
     app.patch('/requests/:id/approve', verifyToken, verifyHR, async (req, res) => {
@@ -1394,6 +1522,7 @@ async function run() {
     // Get employee's team (other employees at same companies)
     app.get('/affiliations/my-team', verifyToken, async (req, res) => {
       try {
+        const { search, company, page = 1, limit = 12 } = req.query;
         const employeeEmail = req.user.email;
 
         // Get all companies this employee is affiliated with
@@ -1405,55 +1534,90 @@ async function run() {
           return res.send({
             success: true,
             data: [],
+            pagination: { total: 0, page: 1, limit: parseInt(limit), totalPages: 0 },
             message: 'No team affiliations yet',
           });
         }
 
-        // Get all team members from these companies
-        const companyEmails = myAffiliations.map(a => a.companyEmail);
+        // Build query for team members
+        let companyEmails = myAffiliations.map(a => a.companyEmail);
         
-        const teammates = await employeeAffiliationsCollection
-          .find({
-            companyEmail: { $in: companyEmails },
-            employeeEmail: { $ne: employeeEmail },
-            status: 'active',
-          })
+        // Filter by specific company if provided
+        if (company) {
+          companyEmails = companyEmails.filter(e => e === company);
+        }
+
+        // Get all employees from these companies (including HRs)
+        let userQuery = {
+          $or: [
+            { email: { $in: companyEmails }, role: 'hr' }, // HRs (company owners)
+          ],
+        };
+
+        // Also get affiliated employees
+        const affiliatedEmployeeEmails = await employeeAffiliationsCollection
+          .find({ companyEmail: { $in: companyEmails }, status: 'active' })
+          .toArray();
+        
+        const employeeEmails = affiliatedEmployeeEmails.map(a => a.employeeEmail);
+        
+        // Include both HRs and affiliated employees
+        userQuery = {
+          $or: [
+            { email: { $in: companyEmails }, role: 'hr' },
+            { email: { $in: employeeEmails } },
+          ],
+          email: { $ne: employeeEmail }, // Exclude self
+        };
+
+        // Search filter
+        if (search) {
+          userQuery.$and = [
+            userQuery.$or ? { $or: userQuery.$or } : {},
+            {
+              $or: [
+                { name: { $regex: search, $options: 'i' } },
+                { email: { $regex: search, $options: 'i' } },
+              ],
+            },
+          ];
+          delete userQuery.$or;
+        }
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const totalCount = await usersCollection.countDocuments(userQuery);
+
+        const teamMembers = await usersCollection
+          .find(userQuery)
+          .project({ name: 1, email: 1, role: 1, profileImage: 1, designation: 1, companyName: 1 })
+          .skip(skip)
+          .limit(parseInt(limit))
           .toArray();
 
-        // Get details and group by company
-        const teamsWithDetails = await Promise.all(
-          myAffiliations.map(async (aff) => {
-            const companyTeammates = teammates.filter(t => t.companyEmail === aff.companyEmail);
-            
-            const teammatesWithDetails = await Promise.all(
-              companyTeammates.map(async (tm) => {
-                const employee = await usersCollection.findOne(
-                  { email: tm.employeeEmail },
-                  { projection: { name: 1, email: 1, profileImage: 1 } }
-                );
-                return { ...tm, employeeDetails: employee };
-              })
-            );
-
-            // Get HR/company info
-            const hr = await usersCollection.findOne(
-              { email: aff.companyEmail },
-              { projection: { name: 1, companyName: 1, companyLogo: 1 } }
-            );
-
+        // Add company info for employees
+        const membersWithCompany = await Promise.all(
+          teamMembers.map(async (member) => {
+            if (member.role === 'hr') {
+              return member;
+            }
+            // Find employee's affiliation to get company name
+            const affiliation = affiliatedEmployeeEmails.find(a => a.employeeEmail === member.email);
             return {
-              companyEmail: aff.companyEmail,
-              companyName: aff.companyName,
-              companyLogo: hr?.companyLogo,
-              hrName: hr?.name,
-              teammates: teammatesWithDetails,
+              ...member,
+              companyName: affiliation?.companyName || member.companyName,
             };
           })
         );
 
         return res.send({
           success: true,
-          data: teamsWithDetails,
+          data: membersWithCompany,
+          pagination: {
+            total: totalCount,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(totalCount / parseInt(limit)),
+          },
         });
       } catch (error) {
         console.error('Error fetching team:', error);

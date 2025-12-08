@@ -1760,6 +1760,134 @@ async function run() {
       }
     });
 
+    // HR Dashboard Stats
+    app.get('/stats/hr', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const hrEmail = req.user.email;
+
+        // Get total assets
+        const totalAssets = await assetsCollection.countDocuments({ companyEmail: hrEmail });
+        
+        // Get available assets
+        const availableAssets = await assetsCollection.countDocuments({ 
+          companyEmail: hrEmail, 
+          availableQuantity: { $gt: 0 } 
+        });
+
+        // Get asset types count
+        const returnableAssets = await assetsCollection.countDocuments({ 
+          companyEmail: hrEmail, 
+          type: 'returnable' 
+        });
+        const nonReturnableAssets = await assetsCollection.countDocuments({ 
+          companyEmail: hrEmail, 
+          type: 'non-returnable' 
+        });
+
+        // Get employee count
+        const totalEmployees = await employeeAffiliationsCollection.countDocuments({ 
+          companyEmail: hrEmail, 
+          status: 'active' 
+        });
+
+        // Get request stats
+        const totalRequests = await requestsCollection.countDocuments({ companyEmail: hrEmail });
+        const pendingRequests = await requestsCollection.countDocuments({ 
+          companyEmail: hrEmail, 
+          status: 'pending' 
+        });
+        const approvedRequests = await requestsCollection.countDocuments({ 
+          companyEmail: hrEmail, 
+          status: 'approved' 
+        });
+        const rejectedRequests = await requestsCollection.countDocuments({ 
+          companyEmail: hrEmail, 
+          status: 'rejected' 
+        });
+
+        return res.send({
+          success: true,
+          data: {
+            totalAssets,
+            availableAssets,
+            returnableAssets,
+            nonReturnableAssets,
+            totalEmployees,
+            totalRequests,
+            pendingRequests,
+            approvedRequests,
+            rejectedRequests,
+          },
+        });
+      } catch (error) {
+        console.error('Error fetching HR stats:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch stats',
+          error: error.message,
+        });
+      }
+    });
+
+    // Employee Dashboard Stats
+    app.get('/stats/employee', verifyToken, async (req, res) => {
+      try {
+        const employeeEmail = req.user.email;
+
+        // Get my requests stats
+        const totalRequests = await requestsCollection.countDocuments({ employeeEmail });
+        const pendingRequests = await requestsCollection.countDocuments({ 
+          employeeEmail, 
+          status: 'pending' 
+        });
+        const approvedRequests = await requestsCollection.countDocuments({ 
+          employeeEmail, 
+          status: 'approved' 
+        });
+
+        // Assets in use (approved)
+        const inUseAssets = await requestsCollection.countDocuments({ 
+          employeeEmail, 
+          status: 'approved' 
+        });
+
+        // Returned assets
+        const returnedAssets = await requestsCollection.countDocuments({ 
+          employeeEmail, 
+          status: 'returned' 
+        });
+
+        // Total assets (approved + returned)
+        const totalAssets = inUseAssets + returnedAssets;
+
+        // Affiliated companies
+        const affiliatedCompanies = await employeeAffiliationsCollection.countDocuments({ 
+          employeeEmail, 
+          status: 'active' 
+        });
+
+        return res.send({
+          success: true,
+          data: {
+            totalAssets,
+            inUseAssets,
+            returnedAssets,
+            totalRequests,
+            pendingRequests,
+            approvedRequests,
+            affiliatedCompanies,
+          },
+        });
+      } catch (error) {
+        console.error('Error fetching employee stats:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch stats',
+          error: error.message,
+        });
+      }
+    });
+
     app.get('/', (req, res) => {
       res.send('AssetVerse server is running');
     });

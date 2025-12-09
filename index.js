@@ -9,10 +9,22 @@ const { MongoClient, ServerApiVersion } = require('mongodb');
 const Stripe = require('stripe');
 const cloudinary = require('cloudinary').v2;
 
-const serviceAccount = require('./assestverse-clientside-firebase-adminsdk-serviceAccountKey.json');
+// Firebase admin credential: prefer base64 env for Vercel, fallback to local JSON
+let firebaseServiceAccount;
+if (process.env.FB_SERVICE_KEY) {
+  try {
+    const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8');
+    firebaseServiceAccount = JSON.parse(decoded);
+  } catch (err) {
+    console.error('Failed to parse FB_SERVICE_KEY, falling back to local file:', err.message);
+  }
+}
+if (!firebaseServiceAccount) {
+  firebaseServiceAccount = require('./assestverse-clientside-firebase-adminsdk-serviceAccountKey.json');
+}
 
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+  credential: admin.credential.cert(firebaseServiceAccount),
 });
 
 const stripe =
@@ -29,11 +41,24 @@ cloudinary.config({
 
 const app = express();
 const port = process.env.PORT || 5000;
-const allowedOrigin = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
+
+// Support multiple origins for CORS (localhost + production Firebase URLs)
+const allowedOrigins = process.env.CLIENT_ORIGIN
+  ? process.env.CLIENT_ORIGIN.split(',')
+  : ['http://localhost:5173'];
 
 app.use(
   cors({
-    origin: allowedOrigin,
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps or curl requests)
+      if (!origin) return callback(null, true);
+      
+      if (allowedOrigins.indexOf(origin) !== -1) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
     credentials: true,
   })
 );
@@ -96,7 +121,8 @@ async function run() {
     await paymentsCollection.createIndex({ stripeSessionId: 1 }, { unique: true }).catch(() => {});
     await paymentsCollection.createIndex({ stripePaymentIntentId: 1 }, { unique: true }).catch(() => {});
 
-    await db.command({ ping: 1 });
+    // Comment out ping command for Vercel deployment (prevents gateway timeout)
+    // await db.command({ ping: 1 });
     console.log('Connected to MongoDB and collections initialized');
 
     // Auth: exchange Firebase ID token for app JWT
@@ -2073,8 +2099,8 @@ async function run() {
             },
           ],
           mode: 'payment',
-          success_url: `${allowedOrigin}/dashboard/upgrade-package?success=true&session_id={CHECKOUT_SESSION_ID}`,
-          cancel_url: `${allowedOrigin}/dashboard/upgrade-package?canceled=true`,
+          success_url: `${allowedOrigins[0]}/dashboard/upgrade-package?success=true&session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${allowedOrigins[0]}/dashboard/upgrade-package?canceled=true`,
           customer_email: hrEmail,
           metadata: {
             hrEmail: hrEmail,

@@ -843,6 +843,174 @@ async function run() {
       }
     });
 
+    // PUBLIC: Browse all assets (no authentication required)
+    // This is for the public assets showcase page
+    app.get('/assets/public/browse', async (req, res) => {
+      try {
+        const { search, type, category, company, page = 1, limit = 12 } = req.query;
+        
+        console.log('Public browse request:', { search, type, category, company, page, limit });
+
+        // Build query conditions - start with empty array for simpler query
+        const conditions = [];
+
+        // Type filter
+        if (type && type !== 'all') {
+          conditions.push({ type: type });
+        }
+
+        // Category filter
+        if (category && category !== 'all') {
+          conditions.push({ category: category });
+        }
+
+        // Company filter
+        if (company) {
+          conditions.push({ companyName: { $regex: company, $options: 'i' } });
+        }
+
+        // Search filter
+        if (search) {
+          conditions.push({
+            $or: [
+              { name: { $regex: search, $options: 'i' } },
+              { category: { $regex: search, $options: 'i' } },
+              { companyName: { $regex: search, $options: 'i' } },
+            ],
+          });
+        }
+
+        const query = conditions.length > 0 ? { $and: conditions } : {};
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const totalCount = await assetsCollection.countDocuments(query);
+
+        const assets = await assetsCollection
+          .find(query)
+          .project({
+            name: 1,
+            type: 1,
+            category: 1,
+            image: 1,
+            companyName: 1,
+            companyLogo: 1,
+            description: 1,
+            availableQuantity: 1,
+            quantity: 1,
+            createdAt: 1,
+          })
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        // Get unique companies for filter using aggregation (distinct not supported in strict API v1)
+        const companiesAgg = await assetsCollection.aggregate([
+          { $match: { companyName: { $exists: true, $ne: null } } },
+          { $group: { _id: '$companyName' } },
+          { $project: { _id: 0, name: '$_id' } },
+        ]).toArray();
+        const companies = companiesAgg.map(c => c.name).filter(Boolean);
+
+        // Get unique categories for filter using aggregation
+        const categoriesAgg = await assetsCollection.aggregate([
+          { $match: { category: { $exists: true, $ne: null } } },
+          { $group: { _id: '$category' } },
+          { $project: { _id: 0, name: '$_id' } },
+        ]).toArray();
+        const categories = categoriesAgg.map(c => c.name).filter(Boolean);
+
+        return res.send({
+          success: true,
+          data: assets,
+          filters: {
+            companies: companies,
+            categories: categories,
+          },
+          pagination: {
+            total: totalCount,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(totalCount / parseInt(limit)),
+          },
+        });
+      } catch (error) {
+        console.error('Error fetching public assets:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch assets',
+          error: error.message,
+        });
+      }
+    });
+
+    // PUBLIC: Get single asset details (no authentication required)
+    app.get('/assets/public/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { ObjectId } = require('mongodb');
+
+        // Validate ObjectId format
+        if (!id || !/^[0-9a-fA-F]{24}$/.test(id)) {
+          return res.status(400).send({
+            success: false,
+            message: 'Invalid asset ID format',
+          });
+        }
+
+        const asset = await assetsCollection.findOne(
+          { _id: new ObjectId(id) },
+          {
+            projection: {
+              name: 1,
+              type: 1,
+              category: 1,
+              image: 1,
+              description: 1,
+              companyName: 1,
+              companyLogo: 1,
+              availableQuantity: 1,
+              quantity: 1,
+              createdAt: 1,
+            },
+          }
+        );
+
+        if (!asset) {
+          return res.status(404).send({
+            success: false,
+            message: 'Asset not found',
+          });
+        }
+
+        // Get related assets from same company
+        const relatedAssets = await assetsCollection
+          .find({
+            companyName: asset.companyName,
+            _id: { $ne: new ObjectId(id) },
+            $or: [
+              { availableQuantity: { $gt: 0 } },
+              { quantity: { $gt: 0 }, availableQuantity: { $exists: false } },
+            ],
+          })
+          .limit(4)
+          .toArray();
+
+        return res.send({
+          success: true,
+          data: asset,
+          relatedAssets,
+        });
+      } catch (error) {
+        console.error('Error fetching public asset:', error);
+        return res.status(500).send({
+          success: false,
+          message: 'Failed to fetch asset',
+          error: error.message,
+        });
+      }
+    });
+
     // Get single asset by ID
     app.get('/assets/:id', verifyToken, async (req, res) => {
       try {

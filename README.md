@@ -24,12 +24,14 @@ A robust Node.js/Express backend server providing RESTful APIs for asset trackin
 ## ✨ Features
 
 ### Authentication & Authorization
+
 - 🔐 Firebase JWT token verification
 - 🍪 Secure HTTP-only cookie-based sessions
 - 👥 Role-based access control (HR & Employee)
 - 🔄 Token refresh mechanism
 
 ### Asset Management (HR)
+
 - ➕ Create, read, update, delete assets
 - 📊 Real-time inventory tracking
 - 🔍 Advanced search, filter, and sort
@@ -38,6 +40,7 @@ A robust Node.js/Express backend server providing RESTful APIs for asset trackin
 - 🏷️ Categorization and tagging
 
 ### Request Management
+
 - 📝 Employee asset requests
 - ✅ HR approval/rejection workflow
 - 🔄 Asset return for returnable items
@@ -45,6 +48,7 @@ A robust Node.js/Express backend server providing RESTful APIs for asset trackin
 - 🔔 Real-time status updates
 
 ### Employee Management
+
 - 👥 Employee affiliation system
 - 📊 Team member tracking
 - 👤 Employee profile management
@@ -52,6 +56,7 @@ A robust Node.js/Express backend server providing RESTful APIs for asset trackin
 - 📈 Package-based employee limits
 
 ### Payment Integration
+
 - 💳 Stripe payment processing
 - 📦 Package upgrade system (Basic, Standard, Premium)
 - 💰 Payment history tracking
@@ -59,6 +64,7 @@ A robust Node.js/Express backend server providing RESTful APIs for asset trackin
 - 🎯 Employee limit enforcement
 
 ### Image Management
+
 - ☁️ Cloudinary integration
 - 📁 Organized folder structure
 - 🔐 Secure signed uploads
@@ -109,6 +115,7 @@ CLOUDINARY_API_SECRET=your_api_secret
 ## 📦 Installation
 
 ### Prerequisites
+
 - Node.js 18 or higher
 - MongoDB Atlas account
 - Firebase project
@@ -119,29 +126,34 @@ CLOUDINARY_API_SECRET=your_api_secret
 ### Local Development
 
 1. **Clone the repository**
+
 ```bash
 git clone https://github.com/your-username/assetverse-server.git
 cd assetverse-server
 ```
 
 2. **Install dependencies**
+
 ```bash
 npm install
 ```
 
 3. **Configure environment variables**
+
 ```bash
 cp .env.example .env
 # Edit .env with your credentials
 ```
 
 4. **Encode Firebase Service Key** (for production)
+
 ```bash
 node encode.js
 # Copy the output to FB_SERVICE_KEY in .env
 ```
 
 5. **Start development server**
+
 ```bash
 npm start
 ```
@@ -151,12 +163,14 @@ Server will be running at `http://localhost:5000`
 ## 🌐 API Endpoints
 
 ### Authentication
+
 ```
 POST   /jwt                    - Exchange Firebase token for JWT
 POST   /logout                 - Clear authentication cookie
 ```
 
 ### Users
+
 ```
 POST   /users                  - Register new user
 GET    /users/:email           - Get user by email
@@ -165,6 +179,7 @@ GET    /users/check/:email     - Check if email exists
 ```
 
 ### Assets (HR Only)
+
 ```
 POST   /assets                 - Create new asset
 GET    /assets                 - Get all assets (with filters)
@@ -177,6 +192,7 @@ GET    /assets/stats/summary   - Get asset statistics
 ```
 
 ### Requests
+
 ```
 POST   /requests               - Create asset request (Employee)
 GET    /requests               - Get requests (filtered by role)
@@ -188,6 +204,7 @@ GET    /requests/stats/summary - Get request statistics (HR)
 ```
 
 ### Employee Affiliations
+
 ```
 GET    /affiliations/employees     - Get HR's employees
 GET    /affiliations/my-team       - Get employee's team
@@ -196,17 +213,20 @@ DELETE /affiliations/:email        - Remove employee (HR)
 ```
 
 ### My Assets (Employee)
+
 ```
 GET    /my-assets              - Get employee's assigned assets
 ```
 
 ### Statistics
+
 ```
 GET    /stats/hr               - Get HR dashboard statistics
 GET    /stats/employee         - Get Employee dashboard statistics
 ```
 
 ### Packages
+
 ```
 GET    /packages               - Get all packages
 GET    /packages/:id           - Get package by ID
@@ -215,6 +235,7 @@ GET    /packages/available     - Get available packages
 ```
 
 ### Payments (Stripe)
+
 ```
 POST   /create-checkout-session    - Create Stripe checkout
 POST   /verify-payment              - Verify payment & upgrade
@@ -224,6 +245,7 @@ GET    /payments/config             - Get payment configuration
 ```
 
 ### Cloudinary
+
 ```
 POST   /cloudinary/signature        - Generate upload signature
 POST   /cloudinary/upload           - Direct upload to Cloudinary
@@ -234,6 +256,7 @@ GET    /cloudinary/config           - Get Cloudinary configuration
 ## 📊 Database Schema
 
 ### Users Collection
+
 ```javascript
 {
   name: String,
@@ -252,6 +275,7 @@ GET    /cloudinary/config           - Get Cloudinary configuration
 ```
 
 ### Assets Collection
+
 ```javascript
 {
   name: String,
@@ -270,6 +294,7 @@ GET    /cloudinary/config           - Get Cloudinary configuration
 ```
 
 ### Requests Collection
+
 ```javascript
 {
   assetId: ObjectId,
@@ -289,6 +314,7 @@ GET    /cloudinary/config           - Get Cloudinary configuration
 ```
 
 ### Employee Affiliations Collection
+
 ```javascript
 {
   employeeEmail: String,
@@ -303,6 +329,7 @@ GET    /cloudinary/config           - Get Cloudinary configuration
 ```
 
 ### Payments Collection
+
 ```javascript
 {
   hrEmail: String,
@@ -324,21 +351,25 @@ GET    /cloudinary/config           - Get Cloudinary configuration
 ### Deploy to Vercel
 
 1. **Install Vercel CLI**
+
 ```bash
 npm install -g vercel
 ```
 
 2. **Login to Vercel**
+
 ```bash
 vercel login
 ```
 
 3. **Deploy**
+
 ```bash
 vercel --prod
 ```
 
 4. **Configure Environment Variables**
+
 - Go to Vercel Dashboard → Your Project
 - Settings → Environment Variables
 - Add all variables from `.env`
@@ -387,18 +418,22 @@ npm run seed:all       # Seed packages + sample assets
 ## 🐛 Troubleshooting
 
 ### Gateway Timeout (504)
+
 - MongoDB ping command is commented out for Vercel compatibility
 
 ### CORS Errors
+
 - Ensure `CLIENT_ORIGIN` includes all client URLs (comma-separated)
 - Redeploy after updating environment variables
 
 ### MongoDB Connection Failed
+
 - Check IP whitelist (0.0.0.0/0)
 - Verify connection string format
 - Ensure user has correct permissions
 
 ### Firebase Token Verification Failed
+
 - Verify `FB_SERVICE_KEY` is base64 encoded correctly
 - Re-run `node encode.js` and update
 
@@ -409,7 +444,25 @@ MIT License - feel free to use this project for learning and commercial purposes
 ## 👨‍💻 Author
 
 **Abbas Yasin**
+
 - GitHub: [@abbasyasin1n2](https://github.com/abbasyasin1n2)
+
+## 🆕 Recent Updates
+
+### v2.0 - January 2026
+
+- **Public Assets API**: New `/assets/public/browse` and `/assets/public/:id` endpoints for non-authenticated browsing
+- **Aggregation Queries**: Replaced `distinct()` with aggregation pipelines for MongoDB Versioned API compatibility
+- **Enhanced Filtering**: Company, category, and type filters for public asset browsing
+- **Related Assets**: Asset details now include related assets from the same company
+- **Pagination Support**: All list endpoints support proper pagination with total counts
+
+### New Public Endpoints
+
+```
+GET    /assets/public/browse   - Browse all available assets (no auth required)
+GET    /assets/public/:id      - Get asset details with related assets (no auth required)
+```
 
 ## 🙏 Acknowledgments
 

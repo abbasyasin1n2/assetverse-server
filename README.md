@@ -70,6 +70,16 @@ A robust Node.js/Express backend server providing RESTful APIs for asset trackin
 - 🔐 Secure signed uploads
 - 🖼️ Direct and client-side upload support
 
+### 🤖 AI Features (Powered by Google Gemini)
+
+- ✨ **Smart Description Generator** - AI-generated professional asset descriptions
+- 🏷️ **Auto-Categorization** - Automatic category and type suggestions for new assets
+- 🔍 **Natural Language Search** - Search assets using conversational queries
+- 📊 **AI Dashboard Insights** - Intelligent analytics and recommendations for HR
+- ⚡ **Request Priority Analyzer** - AI-powered prioritization of pending requests
+- 💬 **AI Chatbot Assistant** - Interactive help for employees and HR managers
+- 🎯 **Asset Recommendations** - Personalized suggestions for employees
+
 ## 🛠️ Tech Stack
 
 - **Runtime**: Node.js 18+
@@ -78,6 +88,7 @@ A robust Node.js/Express backend server providing RESTful APIs for asset trackin
 - **Authentication**: Firebase Admin SDK
 - **Payment**: Stripe
 - **Image Storage**: Cloudinary
+- **AI**: Google Gemini 2.0 Flash (Free Tier)
 - **Security**: JWT, Cookie-Parser, CORS
 - **Deployment**: Vercel (Serverless)
 

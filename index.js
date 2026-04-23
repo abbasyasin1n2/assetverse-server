@@ -39,6 +39,130 @@ cloudinary.config({
   secure: true,
 });
 
+// ============ GEMINI AI CONFIGURATION ============
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// Using gemini-2.5-flash - newest model with separate quota from gemini-2.0-flash
+const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+
+// Simple in-memory cache to reduce API calls - ONLY for identical requests
+const aiCache = new Map();
+const CACHE_TTL = 2 * 60 * 1000; // 2 minutes (shorter to ensure fresh data)
+
+// Simple hash function to create unique cache keys
+function hashString(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return hash.toString(36);
+}
+
+function getCachedResponse(key) {
+  const cached = aiCache.get(key);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    return cached.response;
+  }
+  aiCache.delete(key);
+  return null;
+}
+
+function setCachedResponse(key, response) {
+  // Limit cache size to prevent memory issues
+  if (aiCache.size > 50) {
+    const firstKey = aiCache.keys().next().value;
+    aiCache.delete(firstKey);
+  }
+  aiCache.set(key, { response, timestamp: Date.now() });
+}
+
+// Helper function to sleep for retry logic
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Helper function to call Gemini AI with retry logic
+// useCache: true = cache based on full prompt hash, false = never cache
+async function callGeminiAI(prompt, maxTokens = 1024, useCache = true) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('Gemini API key not configured');
+  }
+
+  // Create unique cache key from FULL prompt hash
+  const cacheKey = `ai_${hashString(prompt)}_${maxTokens}`;
+  if (useCache) {
+    const cached = getCachedResponse(cacheKey);
+    if (cached) {
+      console.log('Using cached AI response for key:', cacheKey.substring(0, 20));
+      return cached;
+    }
+  }
+
+  const maxRetries = 3;
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(`${GEMINI_API_URL}?key=${GEMINI_API_KEY}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [{ text: prompt }],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.7,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: maxTokens,
+          },
+        }),
+      });
+
+      if (response.status === 429) {
+        // Rate limited - parse retry delay if available
+        const errorData = await response.json();
+        const retryDelay = errorData?.error?.details?.find(d => d['@type']?.includes('RetryInfo'))?.retryDelay;
+        const waitTime = retryDelay ? parseInt(retryDelay) * 1000 : Math.pow(2, attempt) * 1000;
+        console.log(`Rate limited. Waiting ${waitTime/1000}s before retry ${attempt}/${maxRetries}`);
+        
+        if (attempt < maxRetries) {
+          await sleep(Math.min(waitTime, 10000)); // Max 10 second wait
+          continue;
+        }
+        throw new Error('AI service is temporarily busy. Please try again in a minute.');
+      }
+
+      if (!response.ok) {
+        const error = await response.text();
+        console.error('Gemini API error:', error);
+        throw new Error('Failed to generate AI response');
+      }
+
+      const data = await response.json();
+      const result = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      
+      // Cache successful response
+      if (result && useCache) {
+        setCachedResponse(cacheKey, result);
+      }
+      
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (attempt < maxRetries && !error.message.includes('temporarily busy')) {
+        console.log(`Attempt ${attempt} failed, retrying...`);
+        await sleep(Math.pow(2, attempt) * 1000);
+      }
+    }
+  }
+
+  throw lastError || new Error('Failed to generate AI response after retries');
+}
+
 const app = express();
 const port = process.env.PORT || 5000;
 
@@ -736,9 +860,11 @@ async function run() {
           query.category = category;
         }
 
-        // Status filter
-        if (status && status !== 'all') {
-          query.status = status;
+        // Status filter - based on availableQuantity, not the status field
+        if (status === 'available') {
+          query.availableQuantity = { $gt: 0 };
+        } else if (status === 'out-of-stock') {
+          query.availableQuantity = { $lte: 0 };
         }
 
         // Sorting
@@ -2584,12 +2710,610 @@ async function run() {
       }
     });
 
+    // ============ AI ROUTES ============
+
+    // Check AI configuration status
+    app.get('/ai/status', (req, res) => {
+      return res.send({
+        success: true,
+        configured: Boolean(GEMINI_API_KEY),
+        model: 'gemini-2.0-flash',
+      });
+    });
+
+    // AI: Generate asset description
+    app.post('/ai/generate-description', verifyToken, async (req, res) => {
+      try {
+        const { productName, category, type, quantity, purchaseDate, purchasePrice } = req.body;
+        const userEmail = req.user.email;
+
+        if (!productName) {
+          return res.status(400).send({
+            success: false,
+            message: 'Product name is required',
+          });
+        }
+
+        // Get company info for context
+        const user = await usersCollection.findOne({ email: userEmail });
+        const companyName = user?.companyName || 'the company';
+
+        const prompt = `Write a 2-3 sentence professional asset description for ${companyName}'s inventory.
+
+Asset: ${productName}
+${category ? `Category: ${category}` : ''}
+${type ? `Type: ${type === 'returnable' ? 'Returnable' : 'Non-returnable'}` : ''}
+${quantity ? `Quantity: ${quantity}` : ''}
+
+Write a complete description that explains what this asset is, its purpose in the workplace, and any relevant details. Be specific to the product. End with a complete sentence.`;
+
+        const response = await callGeminiAI(prompt, 500);
+        
+        // Clean up the response - remove any incomplete sentences at the end
+        let description = response.trim();
+        
+        // If description seems cut off (doesn't end with punctuation), try to fix it
+        if (description && !description.match(/[.!?]$/)) {
+          // Find the last complete sentence
+          const lastPeriod = description.lastIndexOf('.');
+          const lastExclaim = description.lastIndexOf('!');
+          const lastQuestion = description.lastIndexOf('?');
+          const lastComplete = Math.max(lastPeriod, lastExclaim, lastQuestion);
+          
+          if (lastComplete > 0) {
+            description = description.substring(0, lastComplete + 1);
+          }
+        }
+
+        return res.send({
+          success: true,
+          description: description,
+        });
+      } catch (error) {
+        console.error('AI description error:', error);
+        return res.status(500).send({
+          success: false,
+          message: error.message || 'Failed to generate description',
+        });
+      }
+    });
+
+    // AI: Auto-categorize asset
+    app.post('/ai/categorize', verifyToken, async (req, res) => {
+      try {
+        const { productName } = req.body;
+
+        if (!productName) {
+          return res.status(400).send({
+            success: false,
+            message: 'Product name is required',
+          });
+        }
+
+        const categories = [
+          'Laptop', 'Desktop', 'Monitor', 'Phone', 'Tablet',
+          'Keyboard', 'Mouse', 'Headphones', 'Chair', 'Desk',
+          'Furniture', 'Stationery', 'Software License', 'Other'
+        ];
+
+        // Quick keyword matching for common items (faster and more reliable)
+        const productLower = productName.toLowerCase();
+        let quickMatch = null;
+        
+        if (productLower.includes('macbook') || productLower.includes('laptop') || productLower.includes('thinkpad') || productLower.includes('dell xps') || productLower.includes('notebook')) {
+          quickMatch = { category: 'Laptop', type: 'returnable', confidence: 0.95 };
+        } else if (productLower.includes('iphone') || productLower.includes('samsung galaxy') || productLower.includes('pixel') || productLower.includes('phone')) {
+          quickMatch = { category: 'Phone', type: 'returnable', confidence: 0.95 };
+        } else if (productLower.includes('ipad') || productLower.includes('tablet') || productLower.includes('surface')) {
+          quickMatch = { category: 'Tablet', type: 'returnable', confidence: 0.95 };
+        } else if (productLower.includes('monitor') || productLower.includes('display') || productLower.includes('screen')) {
+          quickMatch = { category: 'Monitor', type: 'returnable', confidence: 0.95 };
+        } else if (productLower.includes('imac') || productLower.includes('desktop') || productLower.includes('pc') || productLower.includes('workstation')) {
+          quickMatch = { category: 'Desktop', type: 'returnable', confidence: 0.95 };
+        } else if (productLower.includes('keyboard')) {
+          quickMatch = { category: 'Keyboard', type: 'returnable', confidence: 0.95 };
+        } else if (productLower.includes('mouse') || productLower.includes('trackpad')) {
+          quickMatch = { category: 'Mouse', type: 'returnable', confidence: 0.95 };
+        } else if (productLower.includes('headphone') || productLower.includes('airpods') || productLower.includes('earbuds') || productLower.includes('headset')) {
+          quickMatch = { category: 'Headphones', type: 'returnable', confidence: 0.95 };
+        } else if (productLower.includes('chair') || productLower.includes('seat')) {
+          quickMatch = { category: 'Chair', type: 'returnable', confidence: 0.95 };
+        } else if (productLower.includes('desk') || productLower.includes('table')) {
+          quickMatch = { category: 'Desk', type: 'returnable', confidence: 0.95 };
+        } else if (productLower.includes('pen') || productLower.includes('paper') || productLower.includes('notebook') || productLower.includes('stapler')) {
+          quickMatch = { category: 'Stationery', type: 'non-returnable', confidence: 0.9 };
+        }
+
+        // If quick match found, return immediately (saves API call)
+        if (quickMatch) {
+          return res.send({
+            success: true,
+            ...quickMatch,
+          });
+        }
+
+        // Fall back to AI for unknown products
+        const prompt = `Categorize this product for a corporate asset inventory.
+
+Product: "${productName}"
+
+Categories: ${categories.join(', ')}
+
+Reply with ONLY this JSON (no other text):
+{"category":"CATEGORY","type":"returnable","confidence":0.8}
+
+Rules:
+- Laptop: MacBooks, ThinkPads, notebooks, portable computers
+- Phone: iPhones, Android phones, smartphones
+- Tablet: iPads, Surface tablets
+- Monitor: Displays, screens
+- Desktop: iMacs, PCs, workstations
+- Returnable: Electronics, furniture (items employees return)
+- Non-returnable: Stationery, consumables`;
+
+        const response = await callGeminiAI(prompt, 150);
+        
+        // Parse JSON from response
+        let result;
+        try {
+          // Clean up response - remove markdown code blocks if present
+          const cleanResponse = response.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+          result = JSON.parse(cleanResponse);
+        } catch (parseError) {
+          // Fallback if parsing fails
+          result = {
+            category: 'Other',
+            type: 'returnable',
+            confidence: 0.5,
+          };
+        }
+
+        return res.send({
+          success: true,
+          ...result,
+        });
+      } catch (error) {
+        console.error('AI categorize error:', error);
+        return res.status(500).send({
+          success: false,
+          message: error.message || 'Failed to categorize',
+        });
+      }
+    });
+
+    // AI: Smart search - convert natural language to search parameters
+    app.post('/ai/smart-search', verifyToken, async (req, res) => {
+      try {
+        const { query } = req.body;
+
+        if (!query) {
+          return res.status(400).send({
+            success: false,
+            message: 'Search query is required',
+          });
+        }
+
+        const queryLower = query.toLowerCase();
+        
+        // Keyword matching for categories - more reliable than AI for simple queries
+        const categoryKeywords = {
+          'Laptop': ['laptop', 'macbook', 'notebook', 'thinkpad', 'chromebook'],
+          'Desktop': ['desktop', 'pc', 'workstation', 'imac', 'mac mini'],
+          'Monitor': ['monitor', 'display', 'screen'],
+          'Phone': ['phone', 'iphone', 'android', 'smartphone', 'mobile'],
+          'Tablet': ['tablet', 'ipad'],
+          'Keyboard': ['keyboard'],
+          'Mouse': ['mouse', 'mice'],
+          'Headphones': ['headphone', 'headset', 'earphone', 'airpod', 'earbud'],
+          'Chair': ['chair', 'seat'],
+          'Desk': ['desk', 'table', 'standing desk'],
+          'Furniture': ['furniture', 'cabinet', 'shelf', 'drawer'],
+          'Stationery': ['stationery', 'pen', 'pencil', 'paper', 'notebook'],
+          'Software License': ['software', 'license', 'subscription'],
+        };
+        
+        // Detect category from keywords
+        let detectedCategory = '';
+        for (const [category, keywords] of Object.entries(categoryKeywords)) {
+          if (keywords.some(kw => queryLower.includes(kw))) {
+            detectedCategory = category;
+            break;
+          }
+        }
+        
+        // Detect status
+        let detectedStatus = '';
+        if (queryLower.includes('available') || queryLower.includes('in stock')) {
+          detectedStatus = 'available';
+        } else if (queryLower.includes('out of stock') || queryLower.includes('unavailable')) {
+          detectedStatus = 'out-of-stock';
+        }
+        
+        // Detect type
+        let detectedType = '';
+        if (queryLower.includes('returnable') && !queryLower.includes('non-returnable')) {
+          detectedType = 'returnable';
+        } else if (queryLower.includes('non-returnable') || queryLower.includes('consumable')) {
+          detectedType = 'non-returnable';
+        }
+        
+        // Detect sort
+        let detectedSort = '';
+        if (queryLower.includes('newest') || queryLower.includes('recent') || queryLower.includes('latest')) {
+          detectedSort = 'newest';
+        } else if (queryLower.includes('oldest')) {
+          detectedSort = 'oldest';
+        } else if (queryLower.includes('a-z') || queryLower.includes('alphabetic')) {
+          detectedSort = 'name-asc';
+        }
+        
+        console.log('Smart search parsed:', { query, detectedCategory, detectedStatus, detectedType, detectedSort });
+
+        return res.send({
+          success: true,
+          searchText: '',
+          category: detectedCategory,
+          type: detectedType,
+          status: detectedStatus,
+          sortBy: detectedSort,
+        });
+      } catch (error) {
+        console.error('AI smart search error:', error);
+        return res.status(500).send({
+          success: false,
+          message: error.message || 'Failed to parse search',
+        });
+      }
+    });
+
+    // AI: Generate dashboard insights for HR
+    app.get('/ai/insights', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const hrEmail = req.user.email;
+
+        // Get HR's stats - use companyEmail field (same as dashboard stats)
+        const [assets, requests, employees] = await Promise.all([
+          assetsCollection.find({ companyEmail: hrEmail }).toArray(),
+          requestsCollection.find({ companyEmail: hrEmail }).toArray(),
+          employeeAffiliationsCollection.find({ companyEmail: hrEmail, status: 'active' }).toArray(),
+        ]);
+
+        // Calculate metrics
+        const totalAssets = assets.length;
+        const lowStockAssets = assets.filter(a => a.availableQuantity <= 2 && a.availableQuantity > 0);
+        const outOfStockAssets = assets.filter(a => a.availableQuantity === 0);
+        const pendingRequests = requests.filter(r => r.status === 'pending');
+        const approvedRequests = requests.filter(r => r.status === 'approved');
+        const rejectedRequests = requests.filter(r => r.status === 'rejected');
+
+        // Category breakdown
+        const categoryCount = {};
+        assets.forEach(a => {
+          categoryCount[a.category] = (categoryCount[a.category] || 0) + 1;
+        });
+
+        // Most requested assets
+        const assetRequestCount = {};
+        requests.forEach(r => {
+          if (r.assetName) {
+            assetRequestCount[r.assetName] = (assetRequestCount[r.assetName] || 0) + 1;
+          }
+        });
+        const topRequested = Object.entries(assetRequestCount)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5);
+
+        const prompt = `You are an AI assistant for an asset management system. Analyze these company metrics and provide 3-4 actionable insights.
+
+Company Metrics:
+- Total Assets: ${totalAssets}
+- Low Stock Items (1-2 remaining): ${lowStockAssets.length} ${lowStockAssets.length > 0 ? `(${lowStockAssets.map(a => a.name).slice(0, 3).join(', ')})` : ''}
+- Out of Stock Items: ${outOfStockAssets.length} ${outOfStockAssets.length > 0 ? `(${outOfStockAssets.map(a => a.name).slice(0, 3).join(', ')})` : ''}
+- Total Employees: ${employees.length}
+- Pending Requests: ${pendingRequests.length}
+- Approved Requests: ${approvedRequests.length}
+- Rejected Requests: ${rejectedRequests.length}
+- Category Distribution: ${JSON.stringify(categoryCount)}
+- Most Requested: ${topRequested.map(([name, count]) => `${name} (${count}x)`).join(', ') || 'None yet'}
+
+Generate insights in this exact JSON format (no markdown):
+[
+  {"type": "warning/success/info/tip", "title": "Short title", "message": "Actionable insight", "priority": 1-3}
+]
+
+Types: warning (problems), success (good metrics), info (neutral observation), tip (suggestion)
+Priority: 1 (high), 2 (medium), 3 (low)
+
+Focus on actionable recommendations. Be concise.`;
+
+        // Don't cache insights - they depend on live database metrics
+        const response = await callGeminiAI(prompt, 600, false);
+        
+        let insights;
+        try {
+          const cleanResponse = response.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+          insights = JSON.parse(cleanResponse);
+        } catch (parseError) {
+          insights = [
+            {
+              type: 'info',
+              title: 'Dashboard Overview',
+              message: `You have ${totalAssets} assets, ${employees.length} employees, and ${pendingRequests.length} pending requests.`,
+              priority: 2,
+            },
+          ];
+        }
+
+        return res.send({
+          success: true,
+          insights,
+          metrics: {
+            totalAssets,
+            lowStockCount: lowStockAssets.length,
+            outOfStockCount: outOfStockAssets.length,
+            employeeCount: employees.length,
+            pendingCount: pendingRequests.length,
+            approvalRate: approvedRequests.length + rejectedRequests.length > 0
+              ? Math.round((approvedRequests.length / (approvedRequests.length + rejectedRequests.length)) * 100)
+              : 100,
+          },
+        });
+      } catch (error) {
+        console.error('AI insights error:', error);
+        return res.status(500).send({
+          success: false,
+          message: error.message || 'Failed to generate insights',
+        });
+      }
+    });
+
+    // AI: Analyze and prioritize pending requests
+    app.get('/ai/analyze-requests', verifyToken, verifyHR, async (req, res) => {
+      try {
+        const hrEmail = req.user.email;
+
+        // Get pending requests - use companyEmail field (same as dashboard stats)
+        const pendingRequests = await requestsCollection
+          .find({ companyEmail: hrEmail, status: 'pending' })
+          .sort({ requestDate: 1 })
+          .limit(20)
+          .toArray();
+
+        if (pendingRequests.length === 0) {
+          return res.send({
+            success: true,
+            analysis: [],
+            summary: 'No pending requests to analyze.',
+          });
+        }
+
+        const requestSummary = pendingRequests.map(r => ({
+          id: r._id.toString(),
+          asset: r.assetName,
+          employee: r.employeeName,
+          date: r.requestDate,
+          message: r.message || r.notes || '',
+          daysWaiting: Math.floor((Date.now() - new Date(r.requestDate).getTime()) / (1000 * 60 * 60 * 24)),
+        }));
+
+        const prompt = `You are an HR assistant analyzing asset requests. Prioritize these pending requests.
+
+Pending Requests:
+${requestSummary.map((r, i) => `${i + 1}. ${r.employee} requested "${r.asset}" ${r.daysWaiting} days ago${r.message ? ` - Note: "${r.message}"` : ''}`).join('\n')}
+
+Respond with JSON (no markdown):
+{
+  "analysis": [
+    {"id": "request_id", "priority": "high/medium/low", "reason": "brief reason", "recommendation": "approve/review/defer"}
+  ],
+  "summary": "Brief overall summary"
+}
+
+Priority factors:
+- Waiting time (longer = higher priority)
+- Essential equipment (laptops, monitors = higher)
+- Message urgency indicators
+- First-time requesters`;
+
+        // Don't cache - depends on live pending requests
+        const response = await callGeminiAI(prompt, 800, false);
+        
+        let result;
+        try {
+          const cleanResponse = response.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+          result = JSON.parse(cleanResponse);
+          
+          // Map back the original request IDs
+          result.analysis = result.analysis?.map((a, i) => ({
+            ...a,
+            id: requestSummary[i]?.id || a.id,
+          })) || [];
+        } catch (parseError) {
+          result = {
+            analysis: requestSummary.map(r => ({
+              id: r.id,
+              priority: r.daysWaiting > 3 ? 'high' : r.daysWaiting > 1 ? 'medium' : 'low',
+              reason: `Waiting ${r.daysWaiting} days`,
+              recommendation: 'review',
+            })),
+            summary: `${pendingRequests.length} requests awaiting review.`,
+          };
+        }
+
+        return res.send({
+          success: true,
+          ...result,
+        });
+      } catch (error) {
+        console.error('AI analyze requests error:', error);
+        return res.status(500).send({
+          success: false,
+          message: error.message || 'Failed to analyze requests',
+        });
+      }
+    });
+
+    // AI: Chatbot for employees and HR
+    app.post('/ai/chat', verifyToken, async (req, res) => {
+      try {
+        const { message, context } = req.body;
+        const userEmail = req.user.email;
+        const userRole = req.user.role;
+
+        if (!message) {
+          return res.status(400).send({
+            success: false,
+            message: 'Message is required',
+          });
+        }
+
+        // Get user info
+        const user = await usersCollection.findOne({ email: userEmail });
+
+        // Build context based on role - use companyEmail field (same as dashboard stats)
+        let systemContext = '';
+        if (userRole === 'hr') {
+          const [assetCount, employeeCount, pendingCount] = await Promise.all([
+            assetsCollection.countDocuments({ companyEmail: userEmail }),
+            employeeAffiliationsCollection.countDocuments({ companyEmail: userEmail, status: 'active' }),
+            requestsCollection.countDocuments({ companyEmail: userEmail, status: 'pending' }),
+          ]);
+          systemContext = `User is HR Manager at ${user?.companyName || 'their company'}. They have ${assetCount} assets, ${employeeCount} employees, and ${pendingCount} pending requests.`;
+        } else {
+          const affiliations = await employeeAffiliationsCollection
+            .find({ employeeEmail: userEmail, status: 'active' })
+            .toArray();
+          const myAssets = await requestsCollection
+            .find({ employeeEmail: userEmail, status: 'approved' })
+            .toArray();
+          systemContext = `User is an employee affiliated with ${affiliations.length} companies. They have ${myAssets.length} assigned assets.`;
+        }
+
+        const prompt = `You are AssetVerse AI Assistant, a helpful chatbot for a corporate asset management system.
+
+System Context: ${systemContext}
+${context ? `Previous Context: ${context}` : ''}
+
+User (${userRole}): ${message}
+
+Provide a helpful, concise response. You can help with:
+- Explaining how to use the system
+- Asset management questions
+- Request status inquiries
+- General workplace asset guidance
+
+Keep responses brief (2-3 sentences). Be friendly and professional. If asked to do something you can't (like approving requests), explain what the user should do instead.`;
+
+        // NEVER cache chat responses - each conversation is unique
+        const response = await callGeminiAI(prompt, 300, false);
+
+        return res.send({
+          success: true,
+          response: response.trim(),
+        });
+      } catch (error) {
+        console.error('AI chat error:', error);
+        return res.status(500).send({
+          success: false,
+          message: error.message || 'Failed to process chat',
+        });
+      }
+    });
+
+    // AI: Generate asset recommendations for employees
+    app.get('/ai/recommendations', verifyToken, async (req, res) => {
+      try {
+        const userEmail = req.user.email;
+        
+        // Get user's current assets
+        const myAssets = await requestsCollection
+          .find({ employeeEmail: userEmail, status: 'approved' })
+          .toArray();
+
+        // Get user's affiliations
+        const affiliations = await employeeAffiliationsCollection
+          .find({ employeeEmail: userEmail, status: 'active' })
+          .toArray();
+
+        if (affiliations.length === 0) {
+          return res.send({
+            success: true,
+            recommendations: [],
+            message: 'Join a company to get asset recommendations.',
+          });
+        }
+
+        // Get available assets from affiliated companies
+        const hrEmails = affiliations.map(a => a.hrEmail);
+        const availableAssets = await assetsCollection
+          .find({
+            companyEmail: { $in: hrEmails },
+            availableQuantity: { $gt: 0 },
+          })
+          .limit(50)
+          .toArray();
+
+        const myAssetNames = myAssets.map(a => a.assetName?.toLowerCase() || '');
+
+        const prompt = `You are an asset recommendation AI. Suggest useful assets for this employee.
+
+Employee's Current Assets: ${myAssets.map(a => a.assetName).join(', ') || 'None yet'}
+
+Available Assets:
+${availableAssets.slice(0, 15).map(a => `- ${a.name} (${a.category}, ${a.availableQuantity} available)`).join('\n')}
+
+Recommend 3-5 assets that would complement their current setup. Respond with JSON (no markdown):
+[{"name": "exact asset name from available list", "reason": "brief reason why they might need it"}]
+
+Only recommend assets from the available list that they don't already have.`;
+
+        const response = await callGeminiAI(prompt, 400);
+        
+        let recommendations;
+        try {
+          const cleanResponse = response.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+          recommendations = JSON.parse(cleanResponse);
+          
+          // Match recommendations to actual assets
+          recommendations = recommendations
+            .map(rec => {
+              const asset = availableAssets.find(
+                a => a.name.toLowerCase().includes(rec.name.toLowerCase()) ||
+                     rec.name.toLowerCase().includes(a.name.toLowerCase())
+              );
+              if (asset) {
+                return {
+                  asset,
+                  reason: rec.reason,
+                };
+              }
+              return null;
+            })
+            .filter(Boolean)
+            .slice(0, 5);
+        } catch (parseError) {
+          recommendations = [];
+        }
+
+        return res.send({
+          success: true,
+          recommendations,
+        });
+      } catch (error) {
+        console.error('AI recommendations error:', error);
+        return res.status(500).send({
+          success: false,
+          message: error.message || 'Failed to generate recommendations',
+        });
+      }
+    });
+
     app.get('/', (req, res) => {
-      res.send('AssetVerse server is running');
+      res.send('AssetVerse server is running with AI features powered by Gemini');
     });
 
     app.listen(port, () => {
-      console.log(`AssetVerse server listening on port ${port}`);
+      console.log(`AssetVerse server listening on port ${port} with AI features enabled`);
     });
   } catch (error) {
     console.error('Failed to start server:', error);
